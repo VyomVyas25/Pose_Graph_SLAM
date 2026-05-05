@@ -1,3 +1,5 @@
+
+https://github.com/user-attachments/assets/e59ad69f-744a-4bab-adcc-3fccabcc950b
 # Pose Graph SLAM — Built from Scratch in ROS 2
 
 A 2D LiDAR Pose Graph SLAM system built from scratch in C++/ROS 2, implemented on TurtleBot3 Waffle in Gazebo simulation. The back-end optimisation approach is based on [Cyrill Stachniss's SLAM lectures](https://www.youtube.com/watch?v=uHbRKvD8TWg).
@@ -18,7 +20,11 @@ A 2D LiDAR Pose Graph SLAM system built from scratch in C++/ROS 2, implemented o
 
 ### Full Run Video
 
-![Video](src/media/PGS_rec.mp4)
+!
+
+https://github.com/user-attachments/assets/ccdab64d-5a58-4d1e-bd37-840b231156ff
+
+[Video](src/media/PGS_rec.mp4)
 
 ---
 
