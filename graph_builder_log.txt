@@ -1,0 +1,61 @@
+[INFO] [1777977759.569769937] [graph_builder_node]: LC params: search_dist=2.5 cooldown=5 gap=10 icp_max_dth=0.30 icp_min_ratio=0.80 lc_max_z=2.0
+[INFO] [1777977759.569816566] [graph_builder_node]: GraphBuilder v11 (CLEAN STACHNISS). noise=ON (α=[%.2f,%.2f,%.2f,%.2f]) lc_dist=2.50
+[WARN] [1777977759.569821565] [graph_builder_node]: NOISE ON: α1=0.02 α2=0.01 α3=0.01 α4=0.01 — expect visible drift after 1-2 laps, LC will snap it
+[INFO] [1777977759.569826284] [graph_builder_node]: Consecutive edges: RAW ODOMETRY z (Stachniss slide 14)
+[INFO] [1777977759.569830001] [graph_builder_node]: LC edges: ICP z (Stachniss slide 16)
+[INFO] [1777977759.571639206] [graph_builder_node]: Node 0 at origin.
+[INFO] [1777977911.579851349] [graph_builder_node]: Graph: 2 nodes 1 edges (0 LC) 0 corners
+[INFO] [1777977921.580339964] [graph_builder_node]: Graph: 15 nodes 14 edges (0 LC) 0 corners
+[INFO] [1777977931.581097354] [graph_builder_node]: Graph: 28 nodes 27 edges (0 LC) 19 corners
+[INFO] [1777977941.581706992] [graph_builder_node]: Graph: 41 nodes 40 edges (0 LC) 29 corners
+[INFO] [1777977951.879371936] [graph_builder_node]: Graph: 54 nodes 53 edges (0 LC) 51 corners
+[INFO] [1777977963.629629226] [graph_builder_node]: Graph: 69 nodes 68 edges (0 LC) 51 corners
+[INFO] [1777977973.653440474] [graph_builder_node]: Graph: 82 nodes 81 edges (0 LC) 66 corners
+[INFO] [1777977983.937021066] [graph_builder_node]: Graph: 95 nodes 94 edges (0 LC) 89 corners
+[INFO] [1777977995.924378490] [graph_builder_node]: Graph: 110 nodes 109 edges (0 LC) 113 corners
+[INFO] [1777978007.586398483] [graph_builder_node]: Graph: 125 nodes 124 edges (0 LC) 117 corners
+[INFO] [1777978009.622156959] [graph_builder_node]: ★ LC 116<->127 dist=1.465 feat=odom n=0 rms=0.0385 ratio=1.00 z=[1.275,0.081,-0.011] z_trans=1.278 |z.dth|=0.011 t_dis=0.639 Ω_lc=412
+[WARN] [1777978014.145936633] [graph_builder_node]: LC 119<->133: |z_trans|=2.109>2.00 REJECTED z=[2.109,0.007,-0.040]
+[INFO] [1777978014.172763436] [graph_builder_node]: ★ LC 120<->133 dist=2.141 feat=odom n=0 rms=0.0395 ratio=0.97 z=[1.968,-0.010,-0.048] z_trans=1.968 |z.dth|=0.048 t_dis=0.714 Ω_lc=404
+[INFO] [1777978017.587203150] [graph_builder_node]: Graph: 138 nodes 139 edges (2 LC) 125 corners
+[INFO] [1777978027.665790856] [graph_builder_node]: Graph: 149 nodes 150 edges (2 LC) 137 corners
+[INFO] [1777978037.713056735] [graph_builder_node]: Graph: 163 nodes 164 edges (2 LC) 159 corners
+[INFO] [1777978040.397761146] [graph_builder_node]: ★ LC 55<->165 dist=0.782 feat=odom n=0 rms=0.0398 ratio=1.00 z=[0.172,0.059,-0.106] z_trans=0.182 |z.dth|=0.106 t_dis=0.766 Ω_lc=401
+[INFO] [1777978045.085197596] [graph_builder_node]: ★ LC 61<->170 dist=0.453 feat=odom n=0 rms=0.0362 ratio=1.00 z=[0.058,-0.043,-0.113] z_trans=0.072 |z.dth|=0.113 t_dis=0.403 Ω_lc=433
+[INFO] [1777978049.177645466] [graph_builder_node]: ★ LC 63<->175 dist=0.805 feat=odom n=0 rms=0.0399 ratio=0.99 z=[0.489,-0.151,-0.122] z_trans=0.512 |z.dth|=0.122 t_dis=0.296 Ω_lc=401
+[INFO] [1777978049.589580255] [graph_builder_node]: Graph: 177 nodes 181 edges (5 LC) 159 corners
+[INFO] [1777978053.204340644] [graph_builder_node]: ★ LC 69<->180 dist=0.477 feat=odom n=0 rms=0.0387 ratio=0.91 z=[0.420,-0.209,-0.022] z_trans=0.470 |z.dth|=0.022 t_dis=0.158 Ω_lc=411
+[INFO] [1777978057.547647393] [graph_builder_node]: ★ LC 76<->185 dist=0.190 feat=odom n=0 rms=0.0309 ratio=1.00 z=[-0.054,-0.238,-0.033] z_trans=0.244 |z.dth|=0.033 t_dis=0.411 Ω_lc=489
+[INFO] [1777978059.590243707] [graph_builder_node]: Graph: 190 nodes 196 edges (7 LC) 172 corners
+[WARN] [1777978066.015693619] [graph_builder_node]: LC 83<->193: |z.dth|=0.505 REJECTED
+[INFO] [1777978066.100891186] [graph_builder_node]: ★ LC 84<->193 dist=0.483 feat=odom n=0 rms=0.0383 ratio=0.99 z=[0.546,-0.200,-0.253] z_trans=0.582 |z.dth|=0.253 t_dis=0.590 Ω_lc=414
+[INFO] [1777978071.954512776] [graph_builder_node]: Graph: 199 nodes 206 edges (8 LC) 183 corners
+[INFO] [1777978072.632866781] [graph_builder_node]: ★ LC 90<->199 dist=0.620 feat=odom n=0 rms=0.0376 ratio=0.99 z=[0.594,0.158,0.077] z_trans=0.615 |z.dth|=0.077 t_dis=0.392 Ω_lc=420
+[INFO] [1777978077.663855959] [graph_builder_node]: ★ LC 104<->204 dist=1.720 feat=odom n=0 rms=0.0365 ratio=1.00 z=[-0.405,-0.095,0.236] z_trans=0.416 |z.dth|=0.236 t_dis=1.359 Ω_lc=430
+[INFO] [1777978082.156206970] [graph_builder_node]: ★ LC 108<->209 dist=0.541 feat=odom n=0 rms=0.0258 ratio=1.00 z=[-0.003,0.104,0.020] z_trans=0.105 |z.dth|=0.020 t_dis=0.611 Ω_lc=558
+[INFO] [1777978082.156828120] [graph_builder_node]: Graph: 210 nodes 220 edges (11 LC) 199 corners
+[INFO] [1777978086.719208083] [graph_builder_node]: ★ LC 113<->214 dist=0.313 feat=odom n=0 rms=0.0368 ratio=1.00 z=[0.172,0.121,0.037] z_trans=0.210 |z.dth|=0.037 t_dis=0.520 Ω_lc=428
+[INFO] [1777978090.864535351] [graph_builder_node]: ★ LC 119<->219 dist=0.123 feat=odom n=0 rms=0.0276 ratio=1.00 z=[-0.022,0.171,0.008] z_trans=0.172 |z.dth|=0.008 t_dis=0.167 Ω_lc=532
+[INFO] [1777978093.592674628] [graph_builder_node]: Graph: 224 nodes 236 edges (13 LC) 203 corners
+[INFO] [1777978094.110600444] [graph_builder_node]: ★ LC 116<->224 dist=1.437 feat=odom n=0 rms=0.0359 ratio=1.00 z=[1.446,0.178,0.006] z_trans=1.457 |z.dth|=0.006 t_dis=0.197 Ω_lc=436
+[WARN] [1777978097.878398509] [graph_builder_node]: LC 118<->229: |z_trans|=2.139>2.00 REJECTED z=[2.133,0.158,-0.054]
+[WARN] [1777978097.896134644] [graph_builder_node]: LC 119<->229: |z_trans|=2.007>2.00 REJECTED z=[2.002,0.149,-0.055]
+[INFO] [1777978097.919724021] [graph_builder_node]: ★ LC 120<->229 dist=1.885 feat=odom n=0 rms=0.0325 ratio=1.00 z=[1.876,0.131,-0.066] z_trans=1.881 |z.dth|=0.066 t_dis=0.188 Ω_lc=471
+[INFO] [1777978104.014869018] [graph_builder_node]: Graph: 236 nodes 250 edges (15 LC) 210 corners
+[INFO] [1777978110.211907910] [graph_builder_node]: ★ LC 28<->239 dist=0.699 feat=odom n=0 rms=0.0296 ratio=1.00 z=[0.076,-0.017,0.066] z_trans=0.078 |z.dth|=0.066 t_dis=0.624 Ω_lc=504
+[INFO] [1777978115.102765818] [graph_builder_node]: ★ LC 149<->244 dist=0.114 feat=odom n=0 rms=0.0349 ratio=1.00 z=[0.075,0.031,-0.039] z_trans=0.081 |z.dth|=0.039 t_dis=0.065 Ω_lc=445
+[INFO] [1777978115.103517764] [graph_builder_node]: Graph: 245 nodes 261 edges (17 LC) 219 corners
+[INFO] [1777978127.149447758] [graph_builder_node]: ★ LC 157<->251 dist=1.351 feat=odom n=0 rms=0.0306 ratio=1.00 z=[-0.005,0.264,-0.299] z_trans=0.264 |z.dth|=0.299 t_dis=1.330 Ω_lc=493
+[INFO] [1777978127.150294629] [graph_builder_node]: Graph: 252 nodes 269 edges (18 LC) 229 corners
+[INFO] [1777978137.595872691] [graph_builder_node]: Graph: 266 nodes 283 edges (18 LC) 230 corners
+[INFO] [1777978146.030781086] [graph_builder_node]: ★ LC 186<->276 dist=1.155 feat=odom n=0 rms=0.0326 ratio=1.00 z=[0.236,0.244,0.029] z_trans=0.340 |z.dth|=0.029 t_dis=0.864 Ω_lc=470
+[INFO] [1777978147.597177092] [graph_builder_node]: Graph: 279 nodes 297 edges (19 LC) 240 corners
+[INFO] [1777978150.279265280] [graph_builder_node]: ★ LC 82<->281 dist=0.691 feat=odom n=0 rms=0.0314 ratio=1.00 z=[0.009,-0.075,-0.091] z_trans=0.076 |z.dth|=0.091 t_dis=0.766 Ω_lc=483
+[INFO] [1777978155.329481375] [graph_builder_node]: ★ LC 85<->286 dist=0.740 feat=odom n=0 rms=0.0375 ratio=0.99 z=[0.470,-0.089,-0.255] z_trans=0.479 |z.dth|=0.255 t_dis=1.098 Ω_lc=421
+[INFO] [1777978157.597803362] [graph_builder_node]: Graph: 291 nodes 311 edges (21 LC) 260 corners
+[INFO] [1777978160.018476313] [graph_builder_node]: ★ LC 94<->291 dist=1.077 feat=odom n=0 rms=0.0319 ratio=1.00 z=[-0.241,0.131,0.055] z_trans=0.274 |z.dth|=0.055 t_dis=0.803 Ω_lc=478
+[INFO] [1777978163.518159888] [graph_builder_node]: ★ LC 99<->296 dist=0.855 feat=odom n=0 rms=0.0334 ratio=1.00 z=[-0.002,0.180,-0.110] z_trans=0.180 |z.dth|=0.110 t_dis=0.777 Ω_lc=461
+[INFO] [1777978167.587317399] [graph_builder_node]: ★ LC 104<->301 dist=0.826 feat=odom n=0 rms=0.0332 ratio=1.00 z=[-0.050,-0.066,-0.124] z_trans=0.083 |z.dth|=0.124 t_dis=0.751 Ω_lc=463
+[INFO] [1777978167.598308589] [graph_builder_node]: Graph: 303 nodes 326 edges (24 LC) 280 corners
+[INFO] [1777978173.543505643] [graph_builder_node]: ★ LC 108<->307 dist=0.856 feat=odom n=0 rms=0.0389 ratio=1.00 z=[0.190,-0.097,0.069] z_trans=0.214 |z.dth|=0.069 t_dis=0.743 Ω_lc=409
+[INFO] [1777978177.598988852] [graph_builder_node]: Graph: 314 nodes 338 edges (25 LC) 286 corners

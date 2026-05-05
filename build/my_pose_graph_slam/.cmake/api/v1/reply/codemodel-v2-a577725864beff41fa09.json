@@ -1,0 +1,97 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"hasInstallRule" : true,
+					"jsonFile" : "directory-.-9460aa491b10f17da0fc.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.12"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3,
+						4
+					]
+				}
+			],
+			"name" : "",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "my_pose_graph_slam",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3,
+						4
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "backend_optimizer_node::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-backend_optimizer_node-f497f6c4870a69628815.json",
+					"name" : "backend_optimizer_node",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "graph_builder_node::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-graph_builder_node-c7809c4017bdc9249793.json",
+					"name" : "graph_builder_node",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "my_pose_graph_slam_uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-my_pose_graph_slam_uninstall-a46992b8f790b6aabb95.json",
+					"name" : "my_pose_graph_slam_uninstall",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "point_cloud_map_node::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-point_cloud_map_node-1523ecc06f744ba01002.json",
+					"name" : "point_cloud_map_node",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-uninstall-185f609312a43c7d32e2.json",
+					"name" : "uninstall",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "/home/vyom/pgs_ws/build/my_pose_graph_slam",
+		"source" : "/home/vyom/pgs_ws/src/my_pose_graph_slam"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 3
+	}
+}

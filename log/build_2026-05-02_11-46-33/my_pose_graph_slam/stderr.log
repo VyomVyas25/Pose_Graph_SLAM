@@ -1,0 +1,8 @@
+[01m[K/home/vyom/pgs_ws/src/my_pose_graph_slam/src/GraphBuilderNode.cpp:[m[K In member function ‘[01m[Kvoid GraphBuilderNode::odom_cb(nav_msgs::msg::Odometry_<std::allocator<void> >::SharedPtr)[m[K’:
+[01m[K/home/vyom/pgs_ws/src/my_pose_graph_slam/src/GraphBuilderNode.cpp:381:28:[m[K [01;35m[Kwarning: [m[Kunused variable ‘[01m[Kcx[m[K’ [[01;35m[K]8;;https://gcc.gnu.org/onlinedocs/gcc/Warning-Options.html#index-Wunused-variable-Wunused-variable]8;;[m[K]
+  381 |                     double [01;35m[Kcx[m[K=std::cos(acc_th), sx=std::sin(acc_th);
+      |                            [01;35m[K^~[m[K
+[01m[K/home/vyom/pgs_ws/src/my_pose_graph_slam/src/GraphBuilderNode.cpp:381:49:[m[K [01;35m[Kwarning: [m[Kunused variable ‘[01m[Ksx[m[K’ [[01;35m[K]8;;https://gcc.gnu.org/onlinedocs/gcc/Warning-Options.html#index-Wunused-variable-Wunused-variable]8;;[m[K]
+  381 |    double cx=std::cos(acc_th), [01;35m[Ksx[m[K=std::sin(acc_th);
+      |                                [01;35m[K^~[m[K
+
