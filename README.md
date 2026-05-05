@@ -18,7 +18,7 @@ A 2D LiDAR Pose Graph SLAM system built from scratch in C++/ROS 2, implemented o
 
 ### Full Run Video
 
-https://github.com/VyomVyas25/Pose_Graph_SLAM/blob/main/src/media/PGS_rec.mp4
+![Video](src/media/PGS_rec.mp4)
 
 ---
 
