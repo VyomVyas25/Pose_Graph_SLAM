@@ -6,10 +6,13 @@ A 2D LiDAR Pose Graph SLAM system built from scratch in C++/ROS 2, implemented o
 
 ---
 
-<!-- Replace the lines below with your actual screenshots/GIFs -->
-| Before loop closure | After loop closure |
-|---|---|
-| ![before](docs/before.png) | ![after](docs/after.png) |
+<p align="center">
+  <img src="src/media/PGS_MAP.png"  width="46%" alt="Optimized point-cloud map after Gauss-Newton back-end"/>
+  &nbsp;
+  <img src="src/media/PGS_MAP2.png" width="46%" alt="Pose graph: nodes, odometry edges (blue) and loop-closure edges (red)"/>
+</p>
+
+▶️ **[Watch the full SLAM run (video)](src/media/PGS_rec.mp4)**
 
 ---
 
@@ -44,7 +47,7 @@ The system has three components:
 ```bash
 mkdir -p ~/pgs_ws/src
 cd ~/pgs_ws/src
-git clone https://github.com/<your-username>/pose-graph-slam.git .
+git clone https://github.com/VyomVyas25/Pose_Graph_SLAM.git .
 ```
 
 ### 2. Set TurtleBot3 model

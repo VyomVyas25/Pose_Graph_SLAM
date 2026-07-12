@@ -1,7 +1,0 @@
-{
-  "package_name": "slam_msgs",
-  "non_idl_tuples": [
-    "/home/vyom/pgs_ws/src/slam_msgs:msg/PoseEdge.msg",
-    "/home/vyom/pgs_ws/src/slam_msgs:msg/PoseGraph.msg"
-  ]
-}

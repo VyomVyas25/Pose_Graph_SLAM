@@ -1,0 +1,6 @@
+# Keep GitHub's language stats focused on the real source (C++ / Python),
+# not on generated colcon build artifacts.
+build/**    linguist-generated=true
+install/**  linguist-generated=true
+log/**      linguist-generated=true
+*.launch.py linguist-language=Python
