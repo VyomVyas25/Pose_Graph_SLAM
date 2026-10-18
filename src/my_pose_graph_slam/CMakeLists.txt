@@ -34,7 +34,7 @@ target_link_libraries(backend_optimizer_node Eigen3::Eigen)
 # Point Cloud Map Builder (Option C - no Bresenham)
 add_executable(point_cloud_map_node src/PointCloudMapNode.cpp)
 ament_target_dependencies(point_cloud_map_node
-  rclcpp sensor_msgs nav_msgs tf2 tf2_ros tf2_geometry_msgs)
+  rclcpp sensor_msgs nav_msgs slam_msgs tf2 tf2_ros tf2_geometry_msgs)
 target_link_libraries(point_cloud_map_node Eigen3::Eigen)
 
 install(TARGETS
@@ -46,6 +46,9 @@ install(TARGETS
 # Install launch files so ros2 launch can find them
 install(DIRECTORY launch/
   DESTINATION share/${PROJECT_NAME}/launch)
+
+install(PROGRAMS scripts/drive_loop.py
+  DESTINATION lib/${PROJECT_NAME})
 
 # Install RViz config (OPTIONAL — won't fail if rviz/ is empty)
 install(DIRECTORY rviz/

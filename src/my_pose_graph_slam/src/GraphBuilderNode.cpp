@@ -1,459 +1,419 @@
-#include "rclcpp/rclcpp.hpp"
-#include "nav_msgs/msg/odometry.hpp"
-#include "nav_msgs/msg/path.hpp"
-#include "sensor_msgs/msg/laser_scan.hpp"
-#include "slam_msgs/msg/pose_edge.hpp"
-#include "slam_msgs/msg/pose_graph.hpp"
-#include <tf2/LinearMath/Quaternion.h>
+// ============================================================
+//  GraphBuilderNode - pose graph FRONT END
+//
+//  Same structure as slam_toolbox / Karto and Cartographer (scan matching
+//  refines odometry, loop closures are verified scan matches, the back end
+//  only optimises):
+//
+//   scan + odom      a scan becomes a NODE when the robot moved >= min_node_dist
+//                    or turned >= min_node_rot since the last node. Its odometry
+//                    pose is interpolated AT THE SCAN TIME; the points are moved
+//                    into the BASE frame (lidar mounting offset from TF) and
+//                    deskewed when the scan carries time_increment.
+//   sequential edges odometry edge (motion-model covariance) AND a point-to-line
+//                    ICP edge against a local map of the last nodes, started from
+//                    odometry (Censi 2008). Both go to the back end.
+//   loop closures    candidates near the current pose estimate -> correlative
+//                    search over a window (Olson 2009) -> point-to-line ICP ->
+//                    accepted on overlap + residual. Information = ICP Hessian
+//                    / rms^2 (checked consistent on synthetic scans).
+//   estimates        every node keeps a pose estimate: optimised poses from the
+//                    back end, newer nodes chained on with their sequential edge.
+//                    The back end starts from these (warm start).
+//   map -> odom TF   from the newest node: est * odom^-1 (the unperturbed /odom pose).
+//   /odom_path       the node odometry alone (drift) for comparison with /optimized_path.
+//   node scans       published once per node on /node_scans for the map node.
+//
+//  odom_noise_enabled: perturbs the odometry INCREMENTS (so edges and initial
+//  guesses both drift, as with real odometry) - a fair test of the front end.
+// ============================================================
+#include <rclcpp/rclcpp.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <tf2/utils.h>
-#include <Eigen/Dense>
-#include <Eigen/SVD>
-#include <vector>
-#include <cmath>
-#include <random>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/transform_broadcaster.h>
+#include <slam_msgs/msg/pose_graph.hpp>
+#include <slam_msgs/msg/node_scan.hpp>
+#include <deque>
 #include <mutex>
-#include <algorithm>
+#include <random>
+#include "scan_matching.hpp"
 
-using Point2D = Eigen::Vector2d;
+using sm::Pose2; using sm::Cloud; using sm::Vec2; using sm::between; using sm::wrap;
 
-struct LineSegment { Point2D start, end; double angle, length; };
-struct Corner     { Point2D pos; double descriptor; };
-struct PoseNode {
-    double x, y, th;
-    double raw_x, raw_y, raw_th;
-    int    id;
-    std::vector<Point2D> scan;
-    std::vector<Corner>  corners;
+struct GraphNode {
+    int id; double t;
+    Pose2 odom;      // odometry pose at the scan time (noisy when odom_noise_enabled)
+    Pose2 odom_msg;  // the /odom message pose at the scan time (for the map -> odom TF)
+    Pose2 est;       // current estimate (map frame)
+    Pose2 seq_z;     // sequential relative pose used to chain this node onto the previous one
+    Cloud scan;      // base frame, deskewed, with normals
 };
-struct Edge { slam_msgs::msg::PoseEdge msg; };
-struct IcpResult {
-    double dx, dy, dth, rms, corr_ratio;
-    int iterations; bool converged;
-};
-
-static double norm_angle(double a){
-    while(a> M_PI) a-=2*M_PI;
-    while(a<-M_PI) a+=2*M_PI;
-    return a;
-}
-
-double point_to_line_dist(const Point2D& p,const Point2D& a,const Point2D& b){
-    Point2D ab=b-a; double len=ab.norm();
-    if(len<1e-9) return (p-a).norm();
-    return (p-(a+std::clamp(ab.dot(p-a)/(len*len),0.0,1.0)*ab)).norm();
-}
-void split_and_merge(const std::vector<Point2D>& pts,int s,int e,
-                     double thr,std::vector<LineSegment>& lines){
-    if(e-s<3) return;
-    double md=0; int mi=s;
-    for(int i=s+1;i<e;++i){double d=point_to_line_dist(pts[i],pts[s],pts[e-1]);if(d>md){md=d;mi=i;}}
-    if(md>thr){split_and_merge(pts,s,mi+1,thr,lines);split_and_merge(pts,mi,e,thr,lines);}
-    else{LineSegment ls;ls.start=pts[s];ls.end=pts[e-1];
-         ls.length=(ls.end-ls.start).norm();
-         ls.angle=std::atan2(ls.end.y()-ls.start.y(),ls.end.x()-ls.start.x());
-         if(ls.length>0.15) lines.push_back(ls);}
-}
-bool line_intersection(const LineSegment& l1,const LineSegment& l2,Point2D& pt){
-    double x1=l1.start.x(),y1=l1.start.y(),x2=l1.end.x(),y2=l1.end.y();
-    double x3=l2.start.x(),y3=l2.start.y(),x4=l2.end.x(),y4=l2.end.y();
-    double d=(x1-x2)*(y3-y4)-(y1-y2)*(x3-x4);
-    if(std::abs(d)<1e-9) return false;
-    double t=((x1-x3)*(y3-y4)-(y1-y3)*(x3-x4))/d;
-    pt.x()=x1+t*(x2-x1);pt.y()=y1+t*(y2-y1); return true;
-}
-std::vector<Corner> extract_corners(const std::vector<LineSegment>& lines){
-    std::vector<Corner> corners;
-    for(size_t i=0;i<lines.size();++i)
-        for(size_t j=i+1;j<lines.size();++j){
-            double d=std::min({(lines[i].end-lines[j].start).norm(),(lines[i].start-lines[j].end).norm(),
-                               (lines[i].end-lines[j].end).norm(),(lines[i].start-lines[j].start).norm()});
-            if(d>0.3) continue;
-            double ang=std::abs(lines[i].angle-lines[j].angle);
-            while(ang>M_PI) ang=std::abs(ang-M_PI);
-            if(ang<0.3||ang>2.8) continue;
-            Point2D inter; if(!line_intersection(lines[i],lines[j],inter)) continue;
-            double ds=std::min({(inter-lines[i].start).norm(),(inter-lines[i].end).norm(),
-                                (inter-lines[j].start).norm(),(inter-lines[j].end).norm()});
-            if(ds>1.0) continue;
-            corners.push_back({inter,ang});
-        }
-    return corners;
-}
-std::vector<Corner> extract_features(const std::vector<Point2D>& pts){
-    if(pts.size()<10) return {};
-    std::vector<std::vector<Point2D>> segs;
-    std::vector<Point2D> cur; cur.push_back(pts[0]);
-    for(size_t i=1;i<pts.size();++i){
-        if((pts[i]-pts[i-1]).norm()>0.3){if(cur.size()>=5)segs.push_back(cur);cur.clear();}
-        cur.push_back(pts[i]);
-    }
-    if(cur.size()>=5) segs.push_back(cur);
-    std::vector<LineSegment> all_lines;
-    for(auto& s:segs) split_and_merge(s,0,(int)s.size(),0.05,all_lines);
-    return extract_corners(all_lines);
-}
-
-IcpResult scan_icp(const std::vector<Point2D>& scan_ref,
-                   const std::vector<Point2D>& scan_src,
-                   double init_dx,double init_dy,double init_dth,
-                   int max_iters=50,double conv_thresh=5e-5,double max_corr=0.5)
-{
-    IcpResult res{init_dx,init_dy,init_dth,1e9,0.0,0,false};
-    if(scan_ref.size()<10||scan_src.size()<10) return res;
-    std::vector<Point2D> ref_ds,src_ds;
-    for(size_t i=0;i<scan_ref.size();i+=2) ref_ds.push_back(scan_ref[i]);
-    for(size_t i=0;i<scan_src.size();i+=2) src_ds.push_back(scan_src[i]);
-    if(ref_ds.size()<10||src_ds.size()<10) return res;
-    double c0=std::cos(init_dth),s0=std::sin(init_dth);
-    Eigen::Matrix2d R_total; R_total<<c0,-s0,s0,c0;
-    Eigen::Vector2d t_total(init_dx,init_dy);
-    for(int iter=0;iter<max_iters;++iter){
-        std::vector<Point2D> src_t;
-        for(auto& p:src_ds) src_t.push_back(R_total*p+t_total);
-        std::vector<std::pair<Point2D,Point2D>> corr; double rms_sum=0;
-        for(auto& sp:src_t){
-            double best_d=1e9; size_t best_j=0;
-            for(size_t j=0;j<ref_ds.size();++j){double d=(ref_ds[j]-sp).norm();if(d<best_d){best_d=d;best_j=j;}}
-            if(best_d<max_corr){corr.emplace_back(ref_ds[best_j],sp);rms_sum+=best_d*best_d;}
-        }
-        res.corr_ratio=(double)corr.size()/(double)src_ds.size();
-        if(corr.size()<10||res.corr_ratio<0.25) break;
-        res.rms=std::sqrt(rms_sum/corr.size()); res.iterations=iter+1;
-        Eigen::Vector2d mu_r{0,0},mu_s{0,0};
-        for(auto& [r,sv]:corr){mu_r+=r;mu_s+=sv;}
-        mu_r/=(double)corr.size(); mu_s/=(double)corr.size();
-        Eigen::Matrix2d W=Eigen::Matrix2d::Zero();
-        for(auto& [r,sv]:corr) W+=(r-mu_r)*(sv-mu_s).transpose();
-        Eigen::JacobiSVD<Eigen::Matrix2d> svd(W,Eigen::ComputeFullU|Eigen::ComputeFullV);
-        Eigen::Matrix2d R_inc=svd.matrixU()*svd.matrixV().transpose();
-        if(R_inc.determinant()<0){Eigen::Matrix2d U=svd.matrixU();U.col(1)*=-1;R_inc=U*svd.matrixV().transpose();}
-        Eigen::Vector2d t_inc=mu_r-R_inc*mu_s;
-        t_total=R_inc*t_total+t_inc; R_total=R_inc*R_total;
-        Eigen::JacobiSVD<Eigen::Matrix2d> svd2(R_total,Eigen::ComputeFullU|Eigen::ComputeFullV);
-        R_total=svd2.matrixU()*svd2.matrixV().transpose();
-        if(t_inc.norm()<conv_thresh&&std::abs(std::atan2(R_inc(1,0),R_inc(0,0)))<conv_thresh)
-            {res.converged=true;break;}
-    }
-    {double rs=0;int nc=0;
-     for(auto& p:src_ds){Point2D sp=R_total*p+t_total;double bd=1e9;
-         for(auto& rp:ref_ds) bd=std::min(bd,(rp-sp).norm());
-         if(bd<max_corr){rs+=bd*bd;nc++;}}
-     if(nc>=10){res.rms=std::sqrt(rs/nc);res.corr_ratio=(double)nc/(double)src_ds.size();
-         if(!res.converged&&res.rms<0.02) res.converged=true;}}
-    res.dth=std::atan2(R_total(1,0),R_total(0,0));
-    res.dx=t_total.x(); res.dy=t_total.y();
-    return res;
-}
-
-std::vector<Point2D> scan_to_points(const sensor_msgs::msg::LaserScan& scan){
-    std::vector<Point2D> pts; float angle=scan.angle_min;
-    for(size_t i=0;i<scan.ranges.size();++i){
-        float r=scan.ranges[i];
-        if(r>scan.range_min&&r<scan.range_max&&std::isfinite(r))
-            pts.push_back({r*std::cos(angle),r*std::sin(angle)});
-        angle+=scan.angle_increment;
-    }
-    return pts;
-}
 
 class GraphBuilderNode : public rclcpp::Node {
 public:
     GraphBuilderNode() : Node("graph_builder_node"), rng_(std::random_device{}())
     {
+        odom_topic_  = declare_parameter("odom_topic", std::string("/odom"));
+        scan_topic_  = declare_parameter("scan_topic", std::string("/scan"));
+        map_frame_   = declare_parameter("map_frame", std::string("map"));
+        base_frame_  = declare_parameter("base_frame", std::string(""));            // "" = odom child_frame_id
+        publish_tf_  = declare_parameter("publish_map_odom_tf", true);
+        stamp_end_   = declare_parameter("scan_stamp_at_end", false);  // LD06 driver stamps the END of the rotation; ROS convention = first beam
+        deskew_      = declare_parameter("deskew", true);
+        min_range_   = declare_parameter("min_range", 0.20);           // m - drops returns from the robot's own body
+        max_range_   = declare_parameter("max_range", 8.0);
+        min_dist_    = declare_parameter("min_node_dist", 0.2);
+        min_rot_     = declare_parameter("min_node_rot", 0.3);         // rad
+        // odometry edge covariance: sigma_t = sqrt((kt d)^2 + (ktr a)^2 + ft^2), sigma_r = sqrt((krt d)^2 + (kr a)^2 + fr^2)
+        kt_  = declare_parameter("odom_sigma_trans_per_m", 0.05);
+        ktr_ = declare_parameter("odom_sigma_trans_per_rad", 0.02);
+        krt_ = declare_parameter("odom_sigma_rot_per_m", 0.05);
+        kr_  = declare_parameter("odom_sigma_rot_per_rad", 0.05);
+        ft_  = declare_parameter("odom_sigma_trans_floor", 0.005);
+        fr_  = declare_parameter("odom_sigma_rot_floor", 0.005);
+        // sequential scan matching
+        seq_on_       = declare_parameter("scan_match_sequential", true);
+        seq_nodes_    = declare_parameter("seq_local_map_nodes", 3);
+        seq_overlap_  = declare_parameter("seq_min_overlap", 0.7);
+        seq_rms_      = declare_parameter("seq_max_rms", 0.03);
+        seq_disagree_ = declare_parameter("seq_max_disagree", 0.15);   // m and rad vs odometry
+        icp_floor_    = declare_parameter("icp_sigma_floor", 0.005);    // m - rms floor for the information
+        icp_scale_    = declare_parameter("icp_info_scale", 0.5);       // 0.5 = covariance x2 (safety)
+        // loop closures
+        lc_min_gap_   = declare_parameter("lc_min_node_gap", 20);
+        lc_cooldown_  = declare_parameter("lc_cooldown", 5);
+        lc_dist_      = declare_parameter("lc_search_dist", 1.0);
+        lc_cands_     = declare_parameter("lc_max_candidates", 3);
+        lc_submap_    = declare_parameter("lc_submap_half", 2);         // candidate +- n nodes form the reference
+        lc_win_xy_    = declare_parameter("lc_window_xy", 0.6);
+        lc_win_th_    = declare_parameter("lc_window_th", 0.4);
+        lc_score_     = declare_parameter("lc_min_score", 0.6);
+        lc_overlap_   = declare_parameter("lc_min_overlap", 0.7);
+        lc_rms_       = declare_parameter("lc_max_rms", 0.03);
+        // optional odometry noise (testing)
+        noise_on_ = declare_parameter("odom_noise_enabled", false);
+        a1_ = declare_parameter("noise_alpha1", 0.02); a2_ = declare_parameter("noise_alpha2", 0.005);
+        a3_ = declare_parameter("noise_alpha3", 0.005); a4_ = declare_parameter("noise_alpha4", 0.005);
 
-        min_dist_   = declare_parameter("min_node_dist",   0.2);
-
-        odom_noise_enabled_ = declare_parameter("odom_noise_enabled", false);
-        noise_alpha1_ = declare_parameter("noise_alpha1", 0.02);
-        noise_alpha2_ = declare_parameter("noise_alpha2", 0.005);
-        noise_alpha3_ = declare_parameter("noise_alpha3", 0.005);
-        noise_alpha4_ = declare_parameter("noise_alpha4", 0.005);
-
-        bool n = odom_noise_enabled_;
-
-        lc_min_gap_         = declare_parameter("lc_min_node_gap",   n ? 10   : 20);
-        lc_cooldown_        = declare_parameter("lc_cooldown",        n ? 10   : 30);
-        lc_max_dth_         = declare_parameter("lc_max_dth",         n ? 6.3  : 0.2);
-        icp_max_result_dth_ = declare_parameter("icp_max_result_dth", n ? 0.30 : 0.15);
-        icp_min_ratio_      = declare_parameter("icp_min_ratio",      n ? 0.80 : 0.35);
-        lc_max_corr_        = declare_parameter("lc_max_corr",        0.5);
-        lc_rms_thresh_      = declare_parameter("lc_rms_thresh",      n ? 0.04 : 0.03);
-        lc_max_iters_       = declare_parameter("lc_max_iters",       50);
-        lc_disagree_max_    = declare_parameter("lc_disagree_max",    n ? 2.0  : 0.3);
-        lc_max_z_trans_     = declare_parameter("lc_max_z_trans",     n ? 2.0  : 0.3);
-        lc_dist_            = declare_parameter("lc_search_dist",     n ? 2.5  : 0.5);
-
-        RCLCPP_INFO(get_logger(),
-            "LC params: search_dist=%.1f cooldown=%d gap=%d "
-            "icp_max_dth=%.2f icp_min_ratio=%.2f lc_max_z=%.1f",
-            lc_dist_, lc_cooldown_, lc_min_gap_,
-            icp_max_result_dth_, icp_min_ratio_, lc_max_z_trans_);
-
-        RCLCPP_INFO(get_logger(),
-            "GraphBuilder v11 (CLEAN STACHNISS). noise=%s lc_dist=%.2f",
-            odom_noise_enabled_?"ON (α=[%.2f,%.2f,%.2f,%.2f])":"OFF", lc_dist_);
-        if (odom_noise_enabled_)
-            RCLCPP_WARN(get_logger(),
-                "NOISE ON: α1=%.2f α2=%.2f α3=%.2f α4=%.2f — "
-                "expect visible drift after 1-2 laps, LC will snap it",
-                noise_alpha1_,noise_alpha2_,noise_alpha3_,noise_alpha4_);
-
-        RCLCPP_INFO(get_logger(),"Consecutive edges: RAW ODOMETRY z (Stachniss slide 14)");
-        RCLCPP_INFO(get_logger(),"LC edges: ICP z (Stachniss slide 16)");
-
-        odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-            "/odom",10,std::bind(&GraphBuilderNode::odom_cb,this,std::placeholders::_1));
-        scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
-            "/scan",10,std::bind(&GraphBuilderNode::scan_cb,this,std::placeholders::_1));
-        path_sub_ = create_subscription<nav_msgs::msg::Path>(
-            "/optimized_path",10,
-            std::bind(&GraphBuilderNode::path_cb,this,std::placeholders::_1));
-        graph_pub_ = create_publisher<slam_msgs::msg::PoseGraph>("/pose_graph",10);
-        timer_ = create_wall_timer(std::chrono::seconds(2),
-                     std::bind(&GraphBuilderNode::publish_graph,this));
-        nodes_.push_back({0.0,0.0,0.0, 0.0,0.0,0.0, 0,{},{}});
-        RCLCPP_INFO(get_logger(),"Node 0 at origin.");
+        tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+        tf_pub_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(odom_topic_, 50,
+            std::bind(&GraphBuilderNode::odom_cb, this, std::placeholders::_1));
+        scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(scan_topic_, rclcpp::SensorDataQoS(),
+            std::bind(&GraphBuilderNode::scan_cb, this, std::placeholders::_1));
+        path_sub_ = create_subscription<nav_msgs::msg::Path>("/optimized_path", 10,
+            std::bind(&GraphBuilderNode::path_cb, this, std::placeholders::_1));
+        graph_pub_ = create_publisher<slam_msgs::msg::PoseGraph>("/pose_graph", 10);
+        odom_path_pub_ = create_publisher<nav_msgs::msg::Path>("/odom_path", 10);
+        node_scan_pub_ = create_publisher<slam_msgs::msg::NodeScan>("/node_scans", rclcpp::QoS(2000).reliable());
+        graph_timer_ = create_wall_timer(std::chrono::seconds(2), std::bind(&GraphBuilderNode::publish_graph, this));
+        tf_timer_ = create_wall_timer(std::chrono::milliseconds(50), std::bind(&GraphBuilderNode::publish_tf, this));
+        RCLCPP_INFO(get_logger(), "GraphBuilder: %s + %s | node every %.2f m / %.2f rad | seq ICP %s | LC search %.1f m, window +-%.2f m +-%.2f rad | noise %s",
+                    scan_topic_.c_str(), odom_topic_.c_str(), min_dist_, min_rot_, seq_on_ ? "on" : "off",
+                    lc_dist_, lc_win_xy_, lc_win_th_, noise_on_ ? "ON" : "off");
     }
 
 private:
-
-    void path_cb(const nav_msgs::msg::Path::SharedPtr msg)
-    {
-        std::lock_guard<std::mutex> lock(graph_mutex_);
-        size_t n=std::min(msg->poses.size(), nodes_.size());
-        for(size_t i=0;i<n;++i){
-            nodes_[i].x  = msg->poses[i].pose.position.x;
-            nodes_[i].y  = msg->poses[i].pose.position.y;
-            nodes_[i].th = 2.0*std::atan2(
-                msg->poses[i].pose.orientation.z,
-                msg->poses[i].pose.orientation.w);
-        }
-    }
-
-    void scan_cb(const sensor_msgs::msg::LaserScan::SharedPtr msg){
-        std::lock_guard<std::mutex> lock(scan_mutex_);
-        latest_scan_=scan_to_points(*msg);
-        if(!nodes_.empty()&&nodes_.back().scan.empty()){
-            nodes_.back().scan=latest_scan_;
-            nodes_.back().corners=extract_features(latest_scan_);
-        }
-    }
+    // ---------------- odometry ----------------
+    struct OdomSample { double t; Pose2 p, m; };     // p = used (maybe noisy), m = as in the message
 
     void odom_cb(const nav_msgs::msg::Odometry::SharedPtr msg)
     {
-        double x=msg->pose.pose.position.x,y=msg->pose.pose.position.y;
-        tf2::Quaternion q(msg->pose.pose.orientation.x,msg->pose.pose.orientation.y,
-                          msg->pose.pose.orientation.z,msg->pose.pose.orientation.w);
-        double th=tf2::getYaw(q);
-        if(!has_prev_odom_){prev_odom_x_=x;prev_odom_y_=y;prev_odom_th_=th;has_prev_odom_=true;return;}
-
-        double dx_w=x-prev_odom_x_, dy_w=y-prev_odom_y_;
-        double dth=norm_angle(th-prev_odom_th_);
-        double dist=std::hypot(dx_w,dy_w);
-
-        if(dist < min_dist_) return;
-
-        double c_=std::cos(prev_odom_th_),s_=std::sin(prev_odom_th_);
-        double z_x =  c_*dx_w + s_*dy_w;
-        double z_y = -s_*dx_w + c_*dy_w;
-        double z_th = dth;
-
-        double vt = 0.1*dist*dist + 0.01*dth*dth + 1e-4;
-        double vr = 0.01*dist*dist + 0.1*dth*dth  + 1e-4;
-        double it = std::clamp(1.0/vt, 10.0, 100.0);
-        double ir = std::clamp(1.0/vr,  5.0,  50.0);
-
-        double noise_x=0, noise_y=0, noise_th=0;
-        if(odom_noise_enabled_){
-            double sigma_t = std::sqrt(noise_alpha1_*dist*dist + noise_alpha2_*dth*dth);
-            double sigma_r = std::sqrt(noise_alpha3_*dist*dist + noise_alpha4_*dth*dth);
-            std::normal_distribution<double> nd_t(0.0,sigma_t), nd_r(0.0,sigma_r);
-            double n_lx=nd_t(rng_), n_ly=nd_t(rng_); noise_th=nd_r(rng_);
-            std::lock_guard<std::mutex> lock(graph_mutex_);
-            double cp2=std::cos(nodes_.back().raw_th),sp2=std::sin(nodes_.back().raw_th);
-            noise_x=cp2*n_lx-sp2*n_ly; noise_y=sp2*n_lx+cp2*n_ly;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (base_frame_.empty()) base_frame_ = msg->child_frame_id;
+        odom_frame_ = msg->header.frame_id;
+        const double t = rclcpp::Time(msg->header.stamp).seconds();
+        Pose2 p{msg->pose.pose.position.x, msg->pose.pose.position.y, tf2::getYaw(msg->pose.pose.orientation)};
+        const Pose2 m = p;
+        if (noise_on_) {
+            // perturb the INCREMENT since the last message and integrate it (drifting odometry)
+            if (!have_true_) { true_prev_ = p; noisy_ = p; have_true_ = true; }
+            const Pose2 d = between(true_prev_, p); true_prev_ = p;
+            const double dd = std::hypot(d.x, d.y), da = std::abs(d.th);
+            std::normal_distribution<double> nt(0.0, std::sqrt(a1_ * dd * dd + a2_ * da * da) + 1e-12),
+                                             nr(0.0, std::sqrt(a3_ * dd * dd + a4_ * da * da) + 1e-12);
+            const double et = nt(rng_);
+            noisy_ = noisy_ * Pose2{d.x + et * (dd > 0 ? d.x / dd : 0), d.y + et * (dd > 0 ? d.y / dd : 0), d.th + nr(rng_)};
+            p = noisy_;
         }
-
-        std::lock_guard<std::mutex> lock(graph_mutex_);
-        int from_id=(int)nodes_.size()-1, to_id=(int)nodes_.size();
-
-        slam_msgs::msg::PoseEdge edge;
-        edge.from_id=from_id; edge.to_id=to_id;
-        edge.z={z_x,z_y,z_th,0,0,0};
-        edge.omega={it,0,0,0,it,0,0,0,ir};
-        edge.edge_type="odometry";
-        edges_.push_back({edge});
-
-        const auto& prev=nodes_.back();
-        double cp=std::cos(prev.raw_th),sp=std::sin(prev.raw_th);
-        double nx  = prev.raw_x + cp*z_x - sp*z_y + noise_x;
-        double ny  = prev.raw_y + sp*z_x + cp*z_y + noise_y;
-        double nth = norm_angle(prev.raw_th + z_th + noise_th);
-
-        std::vector<Point2D> cur_scan; std::vector<Corner> cur_corners;
-        {std::lock_guard<std::mutex> lock2(scan_mutex_);
-         cur_scan=latest_scan_; cur_corners=extract_features(latest_scan_);}
-
-        nodes_.push_back({nx,ny,nth, nx,ny,nth, to_id,cur_scan,cur_corners});
-        prev_odom_x_=x; prev_odom_y_=y; prev_odom_th_=th;
-        check_loop_closure(to_id);
+        if (!odom_.empty() && t <= odom_.back().t) return;
+        odom_.push_back({t, p, m});
+        while (odom_.size() > 2000) odom_.pop_front();
+        process_pending();
     }
 
-    void check_loop_closure(int current_id)
+    bool odom_at(double t, Pose2& out, bool message_pose = false) const
     {
-        if(current_id<lc_min_gap_) return;
-        if(current_id-last_lc_node_<lc_cooldown_) return;
-        const auto& cur=nodes_[current_id];
-        if(cur.scan.empty()) return;
+        if (odom_.empty() || t < odom_.front().t || t > odom_.back().t) return false;
+        auto it = std::lower_bound(odom_.begin(), odom_.end(), t, [](const OdomSample& s, double v) { return s.t < v; });
+        const Pose2 OdomSample::* f_ = message_pose ? &OdomSample::m : &OdomSample::p;
+        if (it == odom_.begin()) { out = (*it).*f_; return true; }
+        const Pose2& b = (*it).*f_; const Pose2& a = (*(it - 1)).*f_;
+        const double f = (t - (it - 1)->t) / std::max(it->t - (it - 1)->t, 1e-9);
+        out = {a.x + f * (b.x - a.x), a.y + f * (b.y - a.y), wrap(a.th + f * wrap(b.th - a.th))};
+        return true;
+    }
 
-        for(int i=0;i<current_id-lc_min_gap_;++i){
-            const auto& cand=nodes_[i];
-            if(cand.scan.empty()) continue;
+    // ---------------- scans -> nodes ----------------
+    void scan_cb(const sensor_msgs::msg::LaserScan::SharedPtr msg)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending_.push_back(msg);
+        while (pending_.size() > 20) pending_.pop_front();
+        process_pending();
+    }
 
-            double dist=std::hypot(cur.x-cand.x,cur.y-cand.y);
-            if(dist>lc_dist_) continue;
-
-            double dth_est=std::abs(norm_angle(cur.th-cand.th));
-            if(dth_est>lc_max_dth_) continue;
-
-            double ci=std::cos(cand.th),si=std::sin(cand.th);
-            double ddx=cur.x-cand.x,ddy=cur.y-cand.y;
-            double odom_px= ci*ddx+si*ddy;
-            double odom_py=-si*ddx+ci*ddy;
-            double odom_pth=norm_angle(cur.th-cand.th);
-
-            double init_dx=odom_px,init_dy=odom_py,init_dth=odom_pth;
-            bool used_feat=false; int n_feat=0;
-            if(cand.corners.size()>=3&&cur.corners.size()>=3){
-                struct Match{int a,b;double dd;};
-                std::vector<Match> cands2;
-                for(int a=0;a<(int)cand.corners.size();++a)
-                    for(int b=0;b<(int)cur.corners.size();++b){
-                        double dd=std::abs(cand.corners[a].descriptor-cur.corners[b].descriptor);
-                        if(dd<0.25) cands2.push_back({a,b,dd});}
-                std::sort(cands2.begin(),cands2.end(),[](const Match& x,const Match& y){return x.dd<y.dd;});
-                std::vector<bool> ua(cand.corners.size(),false),ub(cur.corners.size(),false);
-                std::vector<Match> matched;
-                for(auto& m:cands2){if(ua[m.a]||ub[m.b])continue;matched.push_back(m);ua[m.a]=true;ub[m.b]=true;}
-                n_feat=(int)matched.size();
-                if(n_feat>=3){
-                    Eigen::MatrixXd Pi(2,n_feat),Pj(2,n_feat);
-                    for(int k=0;k<n_feat;++k){Pi.col(k)=cand.corners[matched[k].a].pos;Pj.col(k)=cur.corners[matched[k].b].pos;}
-                    Eigen::Vector2d mi=Pi.rowwise().mean(),mj=Pj.rowwise().mean();
-                    Eigen::Matrix2d Ws=(Pi.colwise()-mi)*(Pj.colwise()-mj).transpose();
-                    Eigen::JacobiSVD<Eigen::Matrix2d> sv(Ws,Eigen::ComputeFullU|Eigen::ComputeFullV);
-                    Eigen::Matrix2d Rs=sv.matrixV()*sv.matrixU().transpose();
-                    if(Rs.determinant()<0){Eigen::Matrix2d V=sv.matrixV();V.col(1)*=-1;Rs=V*sv.matrixU().transpose();}
-                    Eigen::Vector2d ts=mj-Rs*mi;
-                    double svd_err=0;for(int k=0;k<n_feat;++k)svd_err+=(Rs*Pi.col(k)+ts-Pj.col(k)).squaredNorm();
-                    svd_err/=n_feat;
-                    if(svd_err<0.08){init_dx=ts.x();init_dy=ts.y();init_dth=std::atan2(Rs(1,0),Rs(0,0));used_feat=true;}
-                }
+    // a scan is processed once the odometry covers its last beam
+    void process_pending()
+    {
+        while (!pending_.empty()) {
+            const auto& s = *pending_.front();
+            const size_t n = s.ranges.size();
+            const double dt = (deskew_ && s.time_increment > 0.f) ? s.time_increment : 0.0;
+            const double stamp = rclcpp::Time(s.header.stamp).seconds();
+            const double t_first = stamp_end_ ? stamp - dt * (n - 1) : stamp, t_last = t_first + dt * (n - 1);
+            if (odom_.empty() || odom_.back().t < t_last) return;                 // wait for odometry
+            auto msg = pending_.front(); pending_.pop_front();
+            Pose2 o_ref;
+            if (!odom_at(t_last, o_ref)) continue;                                // older than the odometry buffer
+            if (!nodes_.empty()) {
+                const Pose2 d = between(nodes_.back().odom, o_ref);
+                if (std::hypot(d.x, d.y) < min_dist_ && std::abs(d.th) < min_rot_) continue;
             }
-
-            IcpResult icp=scan_icp(cand.scan,cur.scan,init_dx,init_dy,init_dth,
-                                   lc_max_iters_,5e-5,lc_max_corr_);
-            if(!icp.converged) continue;
-            if(icp.rms>lc_rms_thresh_){
-                RCLCPP_DEBUG(get_logger(),"LC %d<->%d: rms=%.4f rejected",i,current_id,icp.rms);
-                continue;}
-            if(icp.corr_ratio<icp_min_ratio_) continue;
-
-            double z_trans=std::hypot(icp.dx,icp.dy);
-            if(z_trans>lc_max_z_trans_){
-                RCLCPP_WARN(get_logger(),"LC %d<->%d: |z_trans|=%.3f>%.2f REJECTED z=[%.3f,%.3f,%.3f]",
-                    i,current_id,z_trans,lc_max_z_trans_,icp.dx,icp.dy,icp.dth);
-                continue;}
-
-            double abs_dth=std::abs(norm_angle(icp.dth));
-            if(abs_dth>icp_max_result_dth_){
-                RCLCPP_WARN(get_logger(),"LC %d<->%d: |z.dth|=%.3f REJECTED",i,current_id,abs_dth);
-                continue;}
-
-            double t_dis=std::hypot(icp.dx-odom_px,icp.dy-odom_py);
-            if(t_dis>lc_disagree_max_){
-                RCLCPP_WARN(get_logger(),"LC %d<->%d: t_dis=%.3f REJECTED",i,current_id,t_dis);
-                continue;}
-
-            if(!odom_noise_enabled_){
-                double r_dis=std::abs(norm_angle(icp.dth-odom_pth));
-                if(r_dis>icp_max_result_dth_){
-                    RCLCPP_WARN(get_logger(),"LC %d<->%d: r_dis=%.3f REJECTED",i,current_id,r_dis);
-                    continue;}
+            Pose2 lidar;
+            if (!lidar_pose(msg->header.frame_id, lidar)) continue;
+            Cloud c;
+            for (size_t i = 0; i < n; ++i) {
+                const float r = msg->ranges[i];
+                if (!std::isfinite(r) || r < std::max<double>(msg->range_min, min_range_) || r > std::min<double>(msg->range_max, max_range_)) continue;
+                const double a = msg->angle_min + i * msg->angle_increment;
+                Vec2 p = lidar.apply({r * std::cos(a), r * std::sin(a)});     // base frame at the beam's time
+                if (dt > 0) { Pose2 oi; if (odom_at(t_first + dt * i, oi)) p = between(o_ref, oi).apply(p); }   // -> base frame at t_last
+                c.p.push_back(p);
             }
+            sm::compute_normals(c);
+            Pose2 o_msg; odom_at(t_last, o_msg, true);
+            add_node(t_last, o_ref, o_msg, std::move(c), msg->header.stamp);
+        }
+    }
 
-            double q_=1.0/(icp.rms+0.01);
-            double lc_it, lc_ir;
-            if(odom_noise_enabled_){
-                lc_it=std::clamp(q_*20.0, 200.0, 1000.0);
-                lc_ir=std::clamp(q_*10.0, 100.0,  500.0);
+    bool lidar_pose(const std::string& frame, Pose2& out)
+    {
+        if (have_lidar_) { out = lidar_; return true; }
+        try {
+            auto tf = tf_buffer_->lookupTransform(base_frame_, frame, tf2::TimePointZero);
+            lidar_ = {tf.transform.translation.x, tf.transform.translation.y, tf2::getYaw(tf.transform.rotation)};
+            have_lidar_ = true; out = lidar_;
+            RCLCPP_INFO(get_logger(), "lidar %s in %s: x %.3f y %.3f yaw %.3f", frame.c_str(), base_frame_.c_str(), lidar_.x, lidar_.y, lidar_.th);
+            return true;
+        } catch (const tf2::TransformException& e) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "waiting for TF %s -> %s: %s", base_frame_.c_str(), frame.c_str(), e.what());
+            return false;
+        }
+    }
+
+    // ---------------- edges ----------------
+    void push_edge(int i, int j, const Pose2& z, const Eigen::Matrix3d& omega, const char* type)
+    {
+        slam_msgs::msg::PoseEdge e;
+        e.from_id = i; e.to_id = j; e.edge_type = type;
+        e.z = {z.x, z.y, z.th, 0, 0, 0};
+        for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) e.omega[3 * r + c] = omega(r, c);
+        edges_.push_back(e);
+    }
+
+    Eigen::Matrix3d odom_info(const Pose2& z) const
+    {
+        const double d = std::hypot(z.x, z.y), a = std::abs(z.th);
+        const double vt = kt_ * kt_ * d * d + ktr_ * ktr_ * a * a + ft_ * ft_;
+        const double vr = krt_ * krt_ * d * d + kr_ * kr_ * a * a + fr_ * fr_;
+        return Eigen::Vector3d(1 / vt, 1 / vt, 1 / vr).asDiagonal();
+    }
+
+    Eigen::Matrix3d icp_info(const sm::IcpResult& r) const
+    {
+        const double s = std::max(r.rms, icp_floor_);
+        return icp_scale_ * r.H / (s * s);
+    }
+
+    // reference cloud: nodes [a, b] expressed in node `frame`'s coordinates (current estimates)
+    Cloud local_map(int a, int b, int frame) const
+    {
+        Cloud c; const Pose2 inv = nodes_[frame].est.inverse();
+        for (int k = std::max(0, a); k <= std::min(b, static_cast<int>(nodes_.size()) - 1); ++k) {
+            const Pose2 T = inv * nodes_[k].est;
+            const Eigen::Matrix2d R = Eigen::Rotation2Dd(T.th).toRotationMatrix();
+            for (size_t i = 0; i < nodes_[k].scan.size(); ++i) {
+                c.p.push_back(T.apply(nodes_[k].scan.p[i]));
+                c.n.push_back(R * nodes_[k].scan.n[i]); c.has_n.push_back(nodes_[k].scan.has_n[i]);
+            }
+        }
+        return c;
+    }
+
+    void add_node(double t, const Pose2& odom, const Pose2& odom_msg, Cloud&& scan, const builtin_interfaces::msg::Time& stamp)
+    {
+        GraphNode nd; nd.id = static_cast<int>(nodes_.size()); nd.t = t; nd.odom = odom; nd.odom_msg = odom_msg; nd.scan = std::move(scan);
+        if (nodes_.empty()) {
+            nodes_.push_back(std::move(nd));
+            RCLCPP_INFO(get_logger(), "Node 0 at origin (%zu points).", nodes_[0].scan.size());
+            publish_node_scan(nodes_[0], stamp);
+            return;
+        }
+        const GraphNode& prev = nodes_.back();
+        const Pose2 z_odom = between(prev.odom, odom);
+        push_edge(prev.id, nd.id, z_odom, odom_info(z_odom), "odometry");
+        nd.seq_z = z_odom;
+        if (seq_on_) {
+            const Cloud ref = local_map(prev.id - seq_nodes_ + 1, prev.id, prev.id);
+            const sm::IcpResult r = sm::pl_icp(ref, nd.scan, z_odom);
+            const Pose2 d = between(z_odom, r.T);
+            if (r.ok && r.overlap >= seq_overlap_ && r.rms <= seq_rms_ && std::hypot(d.x, d.y) <= seq_disagree_ && std::abs(d.th) <= seq_disagree_) {
+                push_edge(prev.id, nd.id, r.T, icp_info(r), "scan_match");
+                nd.seq_z = r.T; ++n_seq_ok_;
             } else {
-                lc_it=std::clamp(q_*10.0, 100.0,  500.0);
-                lc_ir=std::clamp(q_* 5.0,  50.0,  250.0);
+                ++n_seq_bad_;
+                RCLCPP_DEBUG(get_logger(), "seq ICP %d->%d rejected: ok %d overlap %.2f rms %.4f", prev.id, nd.id, r.ok, r.overlap, r.rms);
             }
+        }
+        nd.est = prev.est * nd.seq_z;
+        nodes_.push_back(std::move(nd));
+        publish_node_scan(nodes_.back(), stamp);
+        check_loop_closure(static_cast<int>(nodes_.size()) - 1);
+    }
 
-            slam_msgs::msg::PoseEdge lc;
-            lc.from_id=i; lc.to_id=current_id; lc.edge_type="loop_closure";
-            lc.z={icp.dx,icp.dy,icp.dth,0,0,0};
-            lc.omega={lc_it,0,0,0,lc_it,0,0,0,lc_ir};
-            edges_.push_back({lc});
-            last_lc_node_=current_id;
-
-            RCLCPP_INFO(get_logger(),
-                "★ LC %d<->%d dist=%.3f feat=%s n=%d "
-                "rms=%.4f ratio=%.2f z=[%.3f,%.3f,%.3f] "
-                "z_trans=%.3f |z.dth|=%.3f t_dis=%.3f Ω_lc=%.0f",
-                i,current_id,dist,used_feat?"SVD":"odom",n_feat,
-                icp.rms,icp.corr_ratio,
-                icp.dx,icp.dy,icp.dth,z_trans,abs_dth,t_dis,lc_it);
-            break;
+    void check_loop_closure(int cur)
+    {
+        if (cur < lc_min_gap_ || cur - last_lc_ < lc_cooldown_) return;
+        const GraphNode& c = nodes_[cur];
+        std::vector<std::pair<double, int>> cands;
+        for (int i = 0; i <= cur - lc_min_gap_; ++i) {
+            const double d = std::hypot(nodes_[i].est.x - c.est.x, nodes_[i].est.y - c.est.y);
+            if (d <= lc_dist_) cands.push_back({d, i});
+        }
+        std::sort(cands.begin(), cands.end());
+        std::vector<int> tried;
+        for (const auto& [dist, i] : cands) {
+            if (static_cast<int>(tried.size()) >= lc_cands_) break;
+            bool near_tried = false;                                     // candidates far apart along the path
+            for (int k : tried) near_tried |= std::abs(k - i) <= 2 * lc_submap_;
+            if (near_tried) continue;
+            tried.push_back(i);
+            const Cloud ref = local_map(i - lc_submap_, i + lc_submap_, i);
+            const Pose2 guess = between(nodes_[i].est, c.est);
+            double score;
+            const Pose2 coarse = sm::correlative(ref, c.scan, guess, lc_win_xy_, lc_win_th_, score);
+            if (score < lc_score_) { RCLCPP_DEBUG(get_logger(), "LC %d<->%d score %.2f rejected", i, cur, score); continue; }
+            const sm::IcpResult r = sm::pl_icp(ref, c.scan, coarse);
+            if (!r.ok || r.overlap < lc_overlap_ || r.rms > lc_rms_) {
+                RCLCPP_INFO(get_logger(), "LC %d<->%d REJECTED: score %.2f overlap %.2f rms %.4f", i, cur, score, r.overlap, r.rms);
+                continue;
+            }
+            push_edge(i, cur, r.T, icp_info(r), "loop_closure");
+            last_lc_ = cur; ++n_lc_;
+            const Pose2 corr = between(guess, r.T);
+            RCLCPP_INFO(get_logger(), "LC %d<->%d accepted: dist %.2f score %.2f overlap %.2f rms %.4f | correction %.3f m %.3f rad",
+                        i, cur, dist, score, r.overlap, r.rms, std::hypot(corr.x, corr.y), corr.th);
+            return;
         }
     }
 
-    void publish_graph(){
-        std::lock_guard<std::mutex> lock(graph_mutex_);
-        if(nodes_.size()<2) return;
+    // ---------------- back end interface ----------------
+    void path_cb(const nav_msgs::msg::Path::SharedPtr msg)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const size_t n = std::min(msg->poses.size(), nodes_.size());
+        for (size_t i = 0; i < n; ++i) {
+            const auto& p = msg->poses[i].pose;
+            nodes_[i].est = {p.position.x, p.position.y, tf2::getYaw(p.orientation)};
+        }
+        for (size_t i = std::max<size_t>(n, 1); i < nodes_.size(); ++i) nodes_[i].est = nodes_[i - 1].est * nodes_[i].seq_z;
+    }
+
+    void publish_graph()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (nodes_.size() < 2) return;
         slam_msgs::msg::PoseGraph g;
-        g.header.stamp=now(); g.header.frame_id="map";
-        g.num_nodes=(int)nodes_.size();
-
-        for(auto& n:nodes_){
-            g.node_poses.push_back(n.raw_x);
-            g.node_poses.push_back(n.raw_y);
-            g.node_poses.push_back(n.raw_th);
-        }
-        for(auto& e:edges_) g.edges.push_back(e.msg);
+        g.header.stamp = now(); g.header.frame_id = map_frame_;
+        g.num_nodes = static_cast<int>(nodes_.size());
+        for (const auto& n : nodes_) { g.node_poses.push_back(n.est.x); g.node_poses.push_back(n.est.y); g.node_poses.push_back(n.est.th); }
+        g.edges = edges_;
         graph_pub_->publish(g);
-        int n_lc=0,tc=0;
-        for(auto& e:edges_) if(e.msg.edge_type=="loop_closure") n_lc++;
-        for(auto& n:nodes_) tc+=(int)n.corners.size();
-        RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),10000,
-            "Graph: %d nodes %zu edges (%d LC) %d corners",
-            g.num_nodes,edges_.size(),n_lc,tc);
+        // odometry alone (what the graph would be without scan matching), node 0 at the map origin
+        nav_msgs::msg::Path op; op.header = g.header;
+        const Pose2 o0inv = nodes_[0].odom.inverse();
+        for (const auto& n : nodes_) {
+            const Pose2 p = o0inv * n.odom; geometry_msgs::msg::PoseStamped ps; ps.header = g.header;
+            ps.pose.position.x = p.x; ps.pose.position.y = p.y; ps.pose.orientation.z = std::sin(p.th / 2); ps.pose.orientation.w = std::cos(p.th / 2);
+            op.poses.push_back(ps);
+        }
+        odom_path_pub_->publish(op);
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000, "Graph: %zu nodes %zu edges | seq ICP ok %d rejected %d | LC %d",
+                             nodes_.size(), edges_.size(), n_seq_ok_, n_seq_bad_, n_lc_);
     }
 
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr     odom_sub_;
-    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
-    rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr          path_sub_;
-    rclcpp::Publisher<slam_msgs::msg::PoseGraph>::SharedPtr       graph_pub_;
-    rclcpp::TimerBase::SharedPtr timer_;
-    std::mutex graph_mutex_, scan_mutex_;
-    std::vector<PoseNode> nodes_; std::vector<Edge> edges_;
-    std::vector<Point2D> latest_scan_;
-    double prev_odom_x_{},prev_odom_y_{},prev_odom_th_{};
-    bool has_prev_odom_=false;
+    void publish_node_scan(const GraphNode& n, const builtin_interfaces::msg::Time& stamp)
+    {
+        slam_msgs::msg::NodeScan m;
+        m.header.stamp = stamp; m.header.frame_id = base_frame_; m.id = n.id;
+        for (const auto& p : n.scan.p) { m.x.push_back(static_cast<float>(p.x())); m.y.push_back(static_cast<float>(p.y())); }
+        node_scan_pub_->publish(m);
+    }
+
+    void publish_tf()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!publish_tf_ || nodes_.empty() || odom_frame_.empty()) return;
+        const Pose2 T = nodes_.back().est * nodes_.back().odom_msg.inverse();    // map <- odom (the /odom frame the TF tree uses)
+        geometry_msgs::msg::TransformStamped tf;
+        tf.header.stamp = now(); tf.header.frame_id = map_frame_; tf.child_frame_id = odom_frame_;
+        tf.transform.translation.x = T.x; tf.transform.translation.y = T.y;
+        tf.transform.rotation.z = std::sin(T.th / 2); tf.transform.rotation.w = std::cos(T.th / 2);
+        tf_pub_->sendTransform(tf);
+    }
+
+    std::string odom_topic_, scan_topic_, map_frame_, base_frame_, odom_frame_;
+    bool publish_tf_, stamp_end_, deskew_, seq_on_, noise_on_;
+    double min_range_, max_range_, min_dist_, min_rot_, kt_, ktr_, krt_, kr_, ft_, fr_;
+    double seq_overlap_, seq_rms_, seq_disagree_, icp_floor_, icp_scale_;
+    double lc_dist_, lc_win_xy_, lc_win_th_, lc_score_, lc_overlap_, lc_rms_;
+    double a1_, a2_, a3_, a4_;
+    int seq_nodes_, lc_min_gap_, lc_cooldown_, lc_cands_, lc_submap_;
+    int last_lc_ = -1000, n_seq_ok_ = 0, n_seq_bad_ = 0, n_lc_ = 0;
     std::mt19937 rng_;
-    double min_dist_,lc_dist_,lc_max_dth_;
-    int lc_min_gap_,lc_cooldown_,last_lc_node_=-100;
-    bool odom_noise_enabled_;
-    double noise_alpha1_,noise_alpha2_,noise_alpha3_,noise_alpha4_;
-    double lc_max_corr_,lc_rms_thresh_,lc_disagree_max_,lc_max_z_trans_;
-    int lc_max_iters_;
-    double icp_min_ratio_,icp_max_result_dth_;
+    bool have_true_ = false; Pose2 true_prev_, noisy_;
+    bool have_lidar_ = false; Pose2 lidar_;
+
+    std::mutex mutex_;
+    std::deque<OdomSample> odom_;
+    std::deque<sensor_msgs::msg::LaserScan::SharedPtr> pending_;
+    std::vector<GraphNode> nodes_;
+    std::vector<slam_msgs::msg::PoseEdge> edges_;
+
+    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_pub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
+    rclcpp::Publisher<slam_msgs::msg::PoseGraph>::SharedPtr graph_pub_;
+    rclcpp::Publisher<slam_msgs::msg::NodeScan>::SharedPtr node_scan_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr odom_path_pub_;
+    rclcpp::TimerBase::SharedPtr graph_timer_, tf_timer_;
 };
 
-int main(int argc,char** argv){
-    rclcpp::init(argc,argv);
+int main(int argc, char** argv)
+{
+    rclcpp::init(argc, argv);
     rclcpp::spin(std::make_shared<GraphBuilderNode>());
     rclcpp::shutdown();
+    return 0;
 }

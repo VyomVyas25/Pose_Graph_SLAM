@@ -8,6 +8,7 @@ find_package(std_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/PoseEdge.msg"
   "msg/PoseGraph.msg"
+  "msg/NodeScan.msg"
   DEPENDENCIES std_msgs
 )
 
