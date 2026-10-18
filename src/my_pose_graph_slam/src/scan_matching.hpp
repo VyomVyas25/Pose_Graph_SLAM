@@ -49,20 +49,23 @@ struct Cloud {
     size_t size() const { return p.size(); }
 };
 
-// Normals by PCA over neighbours in SCAN ORDER (+-k points, all within max_gap of the centre)
-inline void compute_normals(Cloud& c, int k = 2, double max_gap = 0.10)
+// Normals by PCA over neighbours in SCAN ORDER (+-k points, each within the allowed gap per step of the centre).
+// The allowed gap grows with range (2.5 beam spacings, at least max_gap): far points of a sparse scan
+// still get normals (a fixed 10 cm left points beyond ~8 m without normals, so they could never match).
+inline void compute_normals(Cloud& c, int k = 2, double max_gap = 0.10, double angular_res = 0.0126)
 {
     const int N = static_cast<int>(c.p.size());
     c.n.assign(N, Vec2(0, 0)); c.has_n.assign(N, 0);
     for (int i = 0; i < N; ++i) {
+        const double gap = std::max(max_gap, 2.5 * c.p[i].norm() * angular_res);
         Vec2 m(0, 0); int cnt = 0;
         for (int j = std::max(0, i - k); j <= std::min(N - 1, i + k); ++j)
-            if ((c.p[j] - c.p[i]).norm() < max_gap * std::max(1, std::abs(j - i))) { m += c.p[j]; ++cnt; }
+            if ((c.p[j] - c.p[i]).norm() < gap * std::max(1, std::abs(j - i))) { m += c.p[j]; ++cnt; }
         if (cnt < 3) continue;
         m /= cnt;
         Eigen::Matrix2d C = Eigen::Matrix2d::Zero();
         for (int j = std::max(0, i - k); j <= std::min(N - 1, i + k); ++j)
-            if ((c.p[j] - c.p[i]).norm() < max_gap * std::max(1, std::abs(j - i))) C += (c.p[j] - m) * (c.p[j] - m).transpose();
+            if ((c.p[j] - c.p[i]).norm() < gap * std::max(1, std::abs(j - i))) C += (c.p[j] - m) * (c.p[j] - m).transpose();
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(C);
         if (es.eigenvalues()(1) < 1e-12 || es.eigenvalues()(0) > 0.1 * es.eigenvalues()(1)) continue;   // not line-like
         c.n[i] = es.eigenvectors().col(0); c.has_n[i] = 1;
@@ -96,9 +99,14 @@ struct IcpResult {
     Eigen::Matrix3d H = Eigen::Matrix3d::Zero();     // sum J'J over inliers (unit weights)
 };
 
-// Point-to-line ICP. Correspondence gate shrinks 0.3 -> 0.15 -> 0.08 m (coarse to fine).
-inline IcpResult pl_icp(const Cloud& ref, const Cloud& src, Pose2 T, int max_iters = 40, double overlap_dist = 0.08)
+// Point-to-line ICP. Correspondence gate shrinks 0.3 -> 0.15 -> 0.08 m (coarse to fine), but never below
+// 1.5 beam spacings at the point's range: neighbouring points of a scan are range * angular_res apart
+// (LD06 0.72 deg: 7.5 cm at 6 m, 10 cm at 8 m), so a fixed 8 cm gate dropped correct far matches and
+// under-counted overlap in open areas (found 2026-10-18, big arena: 63 good matches rejected at one junction).
+inline IcpResult pl_icp(const Cloud& ref, const Cloud& src, Pose2 T, int max_iters = 40, double overlap_dist = 0.08,
+                        double angular_res = 0.0126)
 {
+    auto gate = [&](const Vec2& p, double base) { return std::min(0.3, std::max(base, 1.5 * p.norm() * angular_res)); };
     IcpResult res; res.T = T;
     if (ref.size() < 20 || src.size() < 20) return res;
     Grid g(ref, 0.3);
@@ -108,7 +116,7 @@ inline IcpResult pl_icp(const Cloud& ref, const Cloud& src, Pose2 T, int max_ite
         const double c = std::cos(T.th), s = std::sin(T.th); int n = 0;
         for (const auto& p : src.p) {
             const Vec2 q = T.apply(p); double d2;
-            const int j = g.nearest(q, dmax, d2); if (j < 0) continue;
+            const int j = g.nearest(q, gate(p, dmax), d2); if (j < 0) continue;
             const Vec2& nr = ref.n[j];
             const double r = nr.dot(q - ref.p[j]);
             const Eigen::Vector3d J(nr.x(), nr.y(), nr.dot(Vec2(-s * p.x() - c * p.y(), c * p.x() - s * p.y())));
@@ -124,7 +132,7 @@ inline IcpResult pl_icp(const Cloud& ref, const Cloud& src, Pose2 T, int max_ite
     const double c = std::cos(T.th), s = std::sin(T.th); double ss = 0; int n = 0, nin = 0;
     for (const auto& p : src.p) {
         const Vec2 q = T.apply(p); double d2;
-        const int j = g.nearest(q, overlap_dist, d2); if (j < 0) continue;
+        const int j = g.nearest(q, gate(p, overlap_dist), d2); if (j < 0) continue;
         const Vec2& nr = ref.n[j]; const double r = nr.dot(q - ref.p[j]);
         const Eigen::Vector3d J(nr.x(), nr.y(), nr.dot(Vec2(-s * p.x() - c * p.y(), c * p.x() - s * p.y())));
         res.H += J * J.transpose(); ss += r * r; ++n; if (std::abs(r) < 0.03) ++nin;
