@@ -52,6 +52,7 @@ struct GraphNode {
     Pose2 odom_msg;  // the /odom message pose at the scan time (for the map -> odom TF)
     Pose2 est;       // current estimate (map frame)
     Pose2 seq_z;     // sequential relative pose used to chain this node onto the previous one
+    double travel = 0;  // path length driven up to this node (m)
     Cloud scan;      // base frame, deskewed, with normals
 };
 
@@ -87,6 +88,9 @@ public:
         icp_scale_    = declare_parameter("icp_info_scale", 0.5);       // 0.5 = covariance x2 (safety)
         // loop closures
         lc_min_gap_   = declare_parameter("lc_min_node_gap", 20);
+        // AND >= this much driving since the candidate: a 360 deg spin in place makes ~21 nodes at one spot,
+        // so a node-count gap alone let a spin 'close a loop' with itself (found 2026-10-18, big arena corners)
+        lc_min_travel_ = declare_parameter("lc_min_travel", 5.0);
         lc_cooldown_  = declare_parameter("lc_cooldown", 5);
         lc_dist_      = declare_parameter("lc_search_dist", 1.0);
         lc_cands_     = declare_parameter("lc_max_candidates", 3);
@@ -289,6 +293,7 @@ private:
             }
         }
         nd.est = prev.est * nd.seq_z;
+        nd.travel = prev.travel + std::hypot(z_odom.x, z_odom.y);
         nodes_.push_back(std::move(nd));
         publish_node_scan(nodes_.back(), stamp);
         check_loop_closure(static_cast<int>(nodes_.size()) - 1);
@@ -300,6 +305,7 @@ private:
         const GraphNode& c = nodes_[cur];
         std::vector<std::pair<double, int>> cands;
         for (int i = 0; i <= cur - lc_min_gap_; ++i) {
+            if (c.travel - nodes_[i].travel < lc_min_travel_) continue;
             const double d = std::hypot(nodes_[i].est.x - c.est.x, nodes_[i].est.y - c.est.y);
             if (d <= lc_dist_) cands.push_back({d, i});
         }
@@ -388,7 +394,7 @@ private:
     bool publish_tf_, stamp_end_, deskew_, seq_on_, noise_on_;
     double min_range_, max_range_, min_dist_, min_rot_, kt_, ktr_, krt_, kr_, ft_, fr_;
     double seq_overlap_, seq_rms_, seq_disagree_, icp_floor_, icp_scale_;
-    double lc_dist_, lc_win_xy_, lc_win_th_, lc_score_, lc_overlap_, lc_rms_;
+    double lc_dist_, lc_win_xy_, lc_win_th_, lc_score_, lc_overlap_, lc_rms_, lc_min_travel_;
     double a1_, a2_, a3_, a4_;
     int seq_nodes_, lc_min_gap_, lc_cooldown_, lc_cands_, lc_submap_;
     int last_lc_ = -1000, n_seq_ok_ = 0, n_seq_bad_ = 0, n_lc_ = 0;
