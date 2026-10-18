@@ -262,8 +262,13 @@ private:
     {
         GraphNode nd; nd.id = static_cast<int>(nodes_.size()); nd.t = t; nd.odom = odom; nd.odom_msg = odom_msg; nd.scan = std::move(scan);
         if (nodes_.empty()) {
+            // map frame = odom frame at the start: node 0 sits at its odometry pose, NOT at the origin
+            // (the first processed scan can come after the robot already moved - found 2026-10-18:
+            // a 15 deg turn before node 0 rotated the whole map by 15 deg)
+            nd.est = nd.odom;
             nodes_.push_back(std::move(nd));
-            RCLCPP_INFO(get_logger(), "Node 0 at origin (%zu points).", nodes_[0].scan.size());
+            RCLCPP_INFO(get_logger(), "Node 0 at its odometry pose (%.3f, %.3f, %.3f), %zu points.",
+                        nodes_[0].est.x, nodes_[0].est.y, nodes_[0].est.th, nodes_[0].scan.size());
             publish_node_scan(nodes_[0], stamp);
             return;
         }
@@ -347,11 +352,10 @@ private:
         for (const auto& n : nodes_) { g.node_poses.push_back(n.est.x); g.node_poses.push_back(n.est.y); g.node_poses.push_back(n.est.th); }
         g.edges = edges_;
         graph_pub_->publish(g);
-        // odometry alone (what the graph would be without scan matching), node 0 at the map origin
+        // odometry alone (what the graph would be without scan matching), in the map frame (= odom at the start)
         nav_msgs::msg::Path op; op.header = g.header;
-        const Pose2 o0inv = nodes_[0].odom.inverse();
         for (const auto& n : nodes_) {
-            const Pose2 p = o0inv * n.odom; geometry_msgs::msg::PoseStamped ps; ps.header = g.header;
+            const Pose2 p = n.odom; geometry_msgs::msg::PoseStamped ps; ps.header = g.header;
             ps.pose.position.x = p.x; ps.pose.position.y = p.y; ps.pose.orientation.z = std::sin(p.th / 2); ps.pose.orientation.w = std::cos(p.th / 2);
             op.poses.push_back(ps);
         }
