@@ -6,6 +6,7 @@
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
 #include <Eigen/SparseCholesky>
+#include <chrono>
 #include <cmath>
 #include <vector>
 #include <numeric>
@@ -91,7 +92,15 @@ private:
             n_odom,n_odom>0?ot/n_odom:0.0,n_odom>0?or_/n_odom:0.0,
             n_lc,n_lc>0?lt/n_lc:0.0,n_lc>0?lr/n_lc:0.0);
 
+        const auto t0 = std::chrono::steady_clock::now();
         gauss_newton_optimize(max_iters_);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        t_max_ = std::max(t_max_, ms); t_sum_ += ms;
+        if (++t_n_ == 20) {
+            RCLCPP_INFO(get_logger(), "timing: optimisation over 20 solves: mean %.1f ms, max %.1f ms (%d nodes, %zu edges)",
+                        t_sum_ / t_n_, t_max_, n, edges_.size());
+            t_sum_ = t_max_ = 0; t_n_ = 0;
+        }
         publish_markers();
         publish_path();
     }
@@ -342,6 +351,7 @@ private:
     std::vector<PoseNode> nodes_;
     std::vector<PoseEdgeData> edges_;
     int max_iters_;
+    double t_sum_ = 0, t_max_ = 0; int t_n_ = 0;
     double robust_k2_, lambda0_;
 };
 

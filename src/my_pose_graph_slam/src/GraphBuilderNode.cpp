@@ -329,6 +329,7 @@ private:
             }
             push_edge(i, cur, r.T, icp_info(r), "loop_closure");
             last_lc_ = cur; ++n_lc_;
+            publish_graph_locked();
             const Pose2 corr = between(guess, r.T);
             RCLCPP_INFO(get_logger(), "LC %d<->%d accepted: dist %.2f score %.2f overlap %.2f rms %.4f | correction %.3f m %.3f rad",
                         i, cur, dist, score, r.overlap, r.rms, std::hypot(corr.x, corr.y), corr.th);
@@ -351,6 +352,13 @@ private:
     void publish_graph()
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        publish_graph_locked();
+    }
+
+    // caller holds mutex_. Also called right after a loop closure is accepted, so the back end corrects the
+    // map at once instead of up to 2 s later.
+    void publish_graph_locked()
+    {
         if (nodes_.size() < 2) return;
         slam_msgs::msg::PoseGraph g;
         g.header.stamp = now(); g.header.frame_id = map_frame_;

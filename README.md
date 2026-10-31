@@ -29,7 +29,7 @@ The system has three components:
 
 ---
 
-## Front end v2 (validated 2026-10-18)
+## Front end v2 (validated 2026-10-18, retested 2026-10-31)
 
 Pipeline, same structure as slam_toolbox / Karto and Cartographer (scan matching refines odometry; loop closures are verified scan matches; the back end only optimises):
 
@@ -38,7 +38,7 @@ wheel (+IMU) odometry  ->  a scan becomes a NODE every 0.2 m / 0.3 rad
                            odometry pose interpolated at the scan time, points moved into the base frame
                            (lidar offset from TF), deskewed if the scan has time_increment
                        ->  sequential edges: odometry edge + point-to-line ICP edge vs the last 3 node scans
-                       ->  loop closures: candidates within 1 m of the estimate -> correlative search
+                       ->  loop closures: candidates within 1 m of the estimate and >= 5 m of driving ago -> correlative search
                            (+-0.6 m, +-0.4 rad) -> point-to-line ICP -> accept on overlap >= 0.7, rms <= 3 cm
 back end               ->  Gauss-Newton step, Levenberg-Marquardt fallback (a step must lower the cost),
                            warm start from the current estimate, Cauchy kernel on loop closures
@@ -59,6 +59,9 @@ What was checked and changed (v1 code compiled into test programs; GTSAM / scipy
 | ICP (synthetic scans, known transform, 10 mm noise) | point-to-point, median 6.9 mm; rms gate 0.03 rejected 73 % of correct matches | point-to-line, median 1.3 mm, 0.6 ms |
 | Loop closure from a guess 0.5 m / 0.3 rad off | - | 98-100 % found, 0 wrong |
 | Corner-feature initial guess | inverted (cand->cur) | replaced by correlative search |
+| Node 0 | always at (0,0,0): the whole map rotated when the first scan came after a turn | at its odometry pose |
+| ICP gates at long range | - | match gate and normal gap grow with range (LD06 points are 7.5-10 cm apart at 6-8 m) |
+| Loop closures during a 360 deg spin | - | need 5 m of driving (`lc_min_travel`): a spin matching itself locked a ~0.25 deg rotation of the whole map |
 | Lidar mounting offset (-6.4 cm) | ignored: walls doubled even with perfect poses | from TF |
 | Map snapshots | re-posed to the nearest node by position | each node's own scan at its optimised pose |
 | map -> odom | static identity | from the optimised graph |
@@ -68,13 +71,20 @@ End to end, recorded Gazebo runs (Kalparambh, LD06-like lidar), vs Gazebo ground
 | odometry | odometry ATE | v1 ATE | v2 ATE | v2 map: mean distance to true walls |
 |---|---|---|---|---|
 | rover-like (0.1 % scale) - 3 routes | 1.3-3.3 cm | 1.2-2.3 cm | 0.2 cm | 0.2 cm |
-| bad (1.5 % scale, 1.1 deg/m) - 3 routes | 24-63 cm | 20-61 cm (1 LC per run) | 0.2 cm (27-33 LCs) | 0.2 cm |
+| bad (1.5 % scale, 1.1 deg/m) - 3 routes, final code | 26-66 cm | 20-61 cm (1 LC per run) | 0.2-0.3 cm (14+ LCs) | 0.2 cm |
 | bad + LD06 sweep, end stamp | 66 cm | - | 1.5 cm | 1.0 cm |
 | bad + 2 deg lidar angle offset | 66 cm | - | 6.1 cm | 3.8 cm |
 | bad + 45 mm range bias | 66 cm | - | 1.5 cm | 3.0 cm |
 
 Live in `pgs_world`, 3 laps, `noise:=true`: odometry alone 25 cm ATE, v2 2.4 cm (reference = Gazebo wheel odometry, itself a few cm off), 51 loop closures, map median 0.96 cm from the wall faces (sim lidar noise 1 cm).
 On a real lidar, calibrate the mounting yaw first (2 deg costs most), then the range bias.
+
+The rover-odometry and LD06-error rows were measured before the last front-end fixes; the "final code" row is the retest.
+
+Bigger arena (24 x 16 m office floor, figure-8, 180 m, LD06-like scans; same front end, run as a port inside the Kalparambh rover repo, 3x replay, vs exact Gazebo poses):
+odometry alone 7.8 m ATE with bad odometry, 35 cm with rover-quality odometry; final path 2.4 / 2.1 cm; online pose 8.8 / 6.5 cm, peaking at 30 / 18 cm before the first loop closure (dead reckoning through ~70 m of unexplored loop, about 0.4 % of distance). Full-graph solve on 1100 nodes: mean 8 ms, max 34 ms on a laptop.
+
+Known limit: during spins in place the swept, angle-binned scans carry a small heading bias (clean scans do not show it; the exact cause is not proven). Real LD06 data is needed to settle it, and to decide on `seq_local_map_nodes` (3 by default; 21 gives a better online pose and map shape, but a 0.1-0.2 deg rotation of the whole map). All results above are from simulation, not a real robot.
 
 ---
 
