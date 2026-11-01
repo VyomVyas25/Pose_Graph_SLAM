@@ -23,6 +23,17 @@ Visualization Manager:
       Color Transformer: FlatColor
       Color: 230; 230; 230
       Value: true
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Moving points (dropped from SLAM)
+      Enabled: true
+      Topic:
+        Value: /moving_points
+      Style: Flat Squares
+      Size (m): 0.08
+      Color Transformer: FlatColor
+      Color: 255; 0; 0
+      Decay Time: 1
+      Value: true
     - Class: rviz_default_plugins/Path
       Name: Ground truth (Gazebo /odom)
       Enabled: true

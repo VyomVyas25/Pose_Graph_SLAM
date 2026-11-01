@@ -10,6 +10,11 @@
 //                    pose is interpolated AT THE SCAN TIME; the points are moved
 //                    into the BASE frame (lidar mounting offset from TF) and
 //                    deskewed when the scan carries time_increment.
+//   moving objects   before matching, points sitting where an older node's scan looked PAST them (free space
+//                    then, occupied now) are dropped: they moved in. In a long corridor the walls say nothing
+//                    along it, so such points otherwise steer ICP. Dropped points go to /moving_points (map
+//                    frame, one cloud per node). Compares along the chain of sequential steps, so the result
+//                    does not depend on when a back end result arrives.
 //   sequential edges odometry edge (motion-model covariance) AND a point-to-line
 //                    ICP edge against a local map of the last nodes, started from
 //                    odometry (Censi 2008). Both go to the back end.
@@ -31,6 +36,7 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <tf2/utils.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -39,6 +45,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <slam_msgs/msg/pose_graph.hpp>
 #include <slam_msgs/msg/node_scan.hpp>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <random>
@@ -52,7 +59,9 @@ struct GraphNode {
     Pose2 odom_msg;  // the /odom message pose at the scan time (for the map -> odom TF)
     Pose2 est;       // current estimate (map frame)
     Pose2 seq_z;     // sequential relative pose used to chain this node onto the previous one
+    Pose2 chain;     // pose along the chain of seq_z: unlike est, never changes afterwards
     double travel = 0;  // path length driven up to this node (m)
+    std::vector<float> polar;  // nearest return per beam in the lidar frame, full range, 0 = no return (free-space filter)
     Cloud scan;      // base frame, deskewed, with normals
 };
 
@@ -78,6 +87,10 @@ public:
         kr_  = declare_parameter("odom_sigma_rot_per_rad", 0.05);
         ft_  = declare_parameter("odom_sigma_trans_floor", 0.005);
         fr_  = declare_parameter("odom_sigma_rot_floor", 0.005);
+        // moving-object filter: nodes back to compare with, margin (m), +-beams
+        dyn_back_   = declare_parameter<std::vector<int64_t>>("dynamic_filter_back", {4, 8, 12, 16});     // empty = off
+        dyn_margin_ = declare_parameter("dynamic_filter_margin", 0.3);
+        dyn_tol_    = declare_parameter("dynamic_filter_tol", 1);
         // sequential scan matching
         seq_on_       = declare_parameter("scan_match_sequential", true);
         seq_nodes_    = declare_parameter("seq_local_map_nodes", 3);
@@ -116,6 +129,7 @@ public:
             std::bind(&GraphBuilderNode::path_cb, this, std::placeholders::_1));
         graph_pub_ = create_publisher<slam_msgs::msg::PoseGraph>("/pose_graph", 10);
         odom_path_pub_ = create_publisher<nav_msgs::msg::Path>("/odom_path", 10);
+        moved_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/moving_points", 10);
         node_scan_pub_ = create_publisher<slam_msgs::msg::NodeScan>("/node_scans", rclcpp::QoS(2000).reliable());
         graph_timer_ = create_wall_timer(std::chrono::seconds(2), std::bind(&GraphBuilderNode::publish_graph, this));
         tf_timer_ = create_wall_timer(std::chrono::milliseconds(50), std::bind(&GraphBuilderNode::publish_tf, this));
@@ -194,7 +208,13 @@ private:
             Pose2 lidar;
             if (!lidar_pose(msg->header.frame_id, lidar)) continue;
             Cloud c;
+            std::vector<float> polar(n, 0.f);
             for (size_t i = 0; i < n; ++i) {
+                const float rr = msg->ranges[i];
+                if (std::isfinite(rr) && rr >= std::max<double>(msg->range_min, min_range_) && rr < msg->range_max) {
+                    const int b = beam_index(msg->angle_min + i * msg->angle_increment, n);
+                    if (polar[b] == 0.f || rr < polar[b]) polar[b] = rr;
+                }
                 const float r = msg->ranges[i];
                 if (!std::isfinite(r) || r < std::max<double>(msg->range_min, min_range_) || r > std::min<double>(msg->range_max, max_range_)) continue;
                 const double a = msg->angle_min + i * msg->angle_increment;
@@ -202,10 +222,79 @@ private:
                 if (dt > 0) { Pose2 oi; if (odom_at(t_first + dt * i, oi)) p = between(o_ref, oi).apply(p); }   // -> base frame at t_last
                 c.p.push_back(p);
             }
+            filter_moved(c, o_ref, msg->header.stamp);
             sm::compute_normals(c);
             Pose2 o_msg; odom_at(t_last, o_msg, true);
-            add_node(t_last, o_ref, o_msg, std::move(c), msg->header.stamp);
+            add_node(t_last, o_ref, o_msg, std::move(c), std::move(polar), msg->header.stamp);
         }
+    }
+
+    static int beam_index(double angle, size_t n)
+    {
+        return static_cast<int>(std::floor((wrap(angle) + M_PI) / (2 * M_PI) * n)) % static_cast<int>(n);
+    }
+
+    // beams b-w .. b+w of a polar scan: 1 = looked past `range`, 0 = something at or before it, -1 = too few returns to say.
+    // An empty beam is no evidence: real lidars have NaN beams.
+    static int looked_past(const std::vector<float>& img, int b, int w, double range)
+    {
+        const int N = static_cast<int>(img.size());
+        int seen = 0;
+        for (int d = -w; d <= w; ++d) {
+            const float v = img[(b + d + N) % N];
+            if (v == 0.f) continue;
+            if (v <= range) return 0;
+            ++seen;
+        }
+        return 2 * seen >= 2 * w + 1 ? 1 : -1;
+    }
+
+    // drop points in space an older scan looked through (see the header)
+    void filter_moved(Cloud& c, const Pose2& odom, const builtin_interfaces::msg::Time& stamp)
+    {
+        if (dyn_back_.empty() || nodes_.empty()) return;
+        const GraphNode& last = nodes_.back();
+        const Pose2 step = between(last.odom, odom), cur = last.est * step, chain = last.chain * step, lidar_inv = lidar_.inverse();
+        std::vector<char> keep(c.size(), 1);
+        for (const int64_t back : dyn_back_) {
+            const int k = static_cast<int>(nodes_.size()) - static_cast<int>(back);
+            if (k < 0 || nodes_[k].polar.empty()) continue;
+            const Pose2 T = lidar_inv * nodes_[k].chain.inverse() * chain;                       // cur base -> old lidar
+            const auto& img = nodes_[k].polar; const int N = static_cast<int>(img.size());
+            for (size_t i = 0; i < c.size(); ++i) {
+                if (!keep[i]) continue;
+                const Vec2 q = T.apply(c.p[i]); const double r = q.norm();
+                const int b = beam_index(std::atan2(q.y(), q.x()), N);
+                if (looked_past(img, b, dyn_tol_, r + dyn_margin_) == 1) { keep[i] = 0; ++n_dyn_; }
+            }
+        }
+        std::vector<float> moved;
+        size_t w = 0;
+        for (size_t i = 0; i < c.size(); ++i) {
+            if (keep[i]) { c.p[w++] = c.p[i]; continue; }
+            const Vec2 m = cur.apply(c.p[i]);
+            moved.push_back(static_cast<float>(m.x())); moved.push_back(static_cast<float>(m.y())); moved.push_back(0.f);
+        }
+        c.p.resize(w);
+        publish_moved(moved, stamp);
+    }
+
+    void publish_moved(const std::vector<float>& xyz, const builtin_interfaces::msg::Time& stamp)
+    {
+        sensor_msgs::msg::PointCloud2 cl;
+        cl.header.stamp = stamp; cl.header.frame_id = map_frame_;
+        cl.height = 1; cl.width = static_cast<uint32_t>(xyz.size() / 3);
+        cl.is_bigendian = false; cl.is_dense = true;
+        cl.fields.resize(3);
+        const char* names[3] = {"x", "y", "z"};
+        for (int k = 0; k < 3; ++k) {
+            cl.fields[k].name = names[k]; cl.fields[k].offset = 4 * k;
+            cl.fields[k].datatype = sensor_msgs::msg::PointField::FLOAT32; cl.fields[k].count = 1;
+        }
+        cl.point_step = 12; cl.row_step = cl.point_step * cl.width;
+        cl.data.resize(cl.row_step);
+        if (!xyz.empty()) std::memcpy(cl.data.data(), xyz.data(), cl.row_step);
+        moved_pub_->publish(cl);
     }
 
     bool lidar_pose(const std::string& frame, Pose2& out)
@@ -262,14 +351,14 @@ private:
         return c;
     }
 
-    void add_node(double t, const Pose2& odom, const Pose2& odom_msg, Cloud&& scan, const builtin_interfaces::msg::Time& stamp)
+    void add_node(double t, const Pose2& odom, const Pose2& odom_msg, Cloud&& scan, std::vector<float>&& polar, const builtin_interfaces::msg::Time& stamp)
     {
-        GraphNode nd; nd.id = static_cast<int>(nodes_.size()); nd.t = t; nd.odom = odom; nd.odom_msg = odom_msg; nd.scan = std::move(scan);
+        GraphNode nd; nd.id = static_cast<int>(nodes_.size()); nd.t = t; nd.odom = odom; nd.odom_msg = odom_msg; nd.scan = std::move(scan); nd.polar = std::move(polar);
         if (nodes_.empty()) {
             // map frame = odom frame at the start: node 0 sits at its odometry pose, NOT at the origin
             // (the first processed scan can come after the robot already moved - found 2026-10-18:
             // a 15 deg turn before node 0 rotated the whole map by 15 deg)
-            nd.est = nd.odom;
+            nd.est = nd.chain = nd.odom;
             nodes_.push_back(std::move(nd));
             RCLCPP_INFO(get_logger(), "Node 0 at its odometry pose (%.3f, %.3f, %.3f), %zu points.",
                         nodes_[0].est.x, nodes_[0].est.y, nodes_[0].est.th, nodes_[0].scan.size());
@@ -292,7 +381,7 @@ private:
                 RCLCPP_DEBUG(get_logger(), "seq ICP %d->%d rejected: ok %d overlap %.2f rms %.4f", prev.id, nd.id, r.ok, r.overlap, r.rms);
             }
         }
-        nd.est = prev.est * nd.seq_z;
+        nd.est = prev.est * nd.seq_z; nd.chain = prev.chain * nd.seq_z;
         nd.travel = prev.travel + std::hypot(z_odom.x, z_odom.y);
         nodes_.push_back(std::move(nd));
         publish_node_scan(nodes_.back(), stamp);
@@ -374,8 +463,8 @@ private:
             op.poses.push_back(ps);
         }
         odom_path_pub_->publish(op);
-        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000, "Graph: %zu nodes %zu edges | seq ICP ok %d rejected %d | LC %d",
-                             nodes_.size(), edges_.size(), n_seq_ok_, n_seq_bad_, n_lc_);
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000, "Graph: %zu nodes %zu edges | seq ICP ok %d rejected %d | LC %d | moved points dropped %ld",
+                             nodes_.size(), edges_.size(), n_seq_ok_, n_seq_bad_, n_lc_, n_dyn_);
     }
 
     void publish_node_scan(const GraphNode& n, const builtin_interfaces::msg::Time& stamp)
@@ -406,6 +495,7 @@ private:
     double a1_, a2_, a3_, a4_;
     int seq_nodes_, lc_min_gap_, lc_cooldown_, lc_cands_, lc_submap_;
     int last_lc_ = -1000, n_seq_ok_ = 0, n_seq_bad_ = 0, n_lc_ = 0;
+    std::vector<int64_t> dyn_back_; double dyn_margin_; int dyn_tol_; long n_dyn_ = 0;
     std::mt19937 rng_;
     bool have_true_ = false; Pose2 true_prev_, noisy_;
     bool have_lidar_ = false; Pose2 lidar_;
@@ -425,6 +515,7 @@ private:
     rclcpp::Publisher<slam_msgs::msg::PoseGraph>::SharedPtr graph_pub_;
     rclcpp::Publisher<slam_msgs::msg::NodeScan>::SharedPtr node_scan_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr odom_path_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr moved_pub_;
     rclcpp::TimerBase::SharedPtr graph_timer_, tf_timer_;
 };
 

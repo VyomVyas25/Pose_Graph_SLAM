@@ -3,7 +3,7 @@
 A 2D LiDAR Pose Graph SLAM system built from scratch in C++/ROS 2, implemented on TurtleBot3 Waffle in Gazebo simulation. The back-end optimisation approach is based on [Cyrill Stachniss's SLAM lectures](https://www.youtube.com/watch?v=uHbRKvD8TWg).
 
 > **v1 demo:** chi² reduced 99.94% (11,404 → 6.79) in 7 Gauss-Newton iterations across 668 nodes with 24 loop closures.
-> v1's `noise:=true` only perturbed the initial guesses (edges stayed clean), so that demo did not exercise loop closure - see [Front end v2](#front-end-v2-validated-2026-10-18).
+> v1's `noise:=true` only perturbed the initial guesses (edges stayed clean), so that demo did not exercise loop closure - see [Front end v2](#front-end-v2-validated-2026-10-18-retested-2026-10-31-moving-objects-2026-11-02).
 
 ---
 
@@ -23,13 +23,13 @@ Pose Graph SLAM builds a map by maintaining a graph of robot poses connected by 
 
 The system has three components:
 
-- **GraphBuilderNode** — front-end: creates pose nodes, odometry edges, and loop closure edges from `/odom` and `/scan`
+- **GraphBuilderNode** — front-end: creates pose nodes, odometry edges, and loop closure edges from `/odom` and `/scan`; drops moving objects before matching
 - **BackendOptimizer** — back-end: Gauss-Newton sparse optimiser, produces corrected `/optimized_path`
 - **PointCloudMapNode** — map builder: reprojects all stored LiDAR scans using corrected poses, publishes `/point_cloud_map`
 
 ---
 
-## Front end v2 (validated 2026-10-18, retested 2026-10-31)
+## Front end v2 (validated 2026-10-18, retested 2026-10-31, moving objects 2026-11-02)
 
 Pipeline, same structure as slam_toolbox / Karto and Cartographer (scan matching refines odometry; loop closures are verified scan matches; the back end only optimises):
 
@@ -37,6 +37,7 @@ Pipeline, same structure as slam_toolbox / Karto and Cartographer (scan matching
 wheel (+IMU) odometry  ->  a scan becomes a NODE every 0.2 m / 0.3 rad
                            odometry pose interpolated at the scan time, points moved into the base frame
                            (lidar offset from TF), deskewed if the scan has time_increment
+                       ->  points that moved into space an older scan looked through are dropped
                        ->  sequential edges: odometry edge + point-to-line ICP edge vs the last 3 node scans
                        ->  loop closures: candidates within 1 m of the estimate and >= 5 m of driving ago -> correlative search
                            (+-0.6 m, +-0.4 rad) -> point-to-line ICP -> accept on overlap >= 0.7, rms <= 3 cm
@@ -83,6 +84,23 @@ The rover-odometry and LD06-error rows were measured before the last front-end f
 
 Bigger arena (24 x 16 m office floor, figure-8, 180 m, LD06-like scans; same front end, run as a port inside the Kalparambh rover repo, 3x replay, vs exact Gazebo poses):
 odometry alone 7.8 m ATE with bad odometry, 35 cm with rover-quality odometry; final path 2.4 / 2.1 cm; online pose 8.8 / 6.5 cm, peaking at 30 / 18 cm before the first loop closure (dead reckoning through ~70 m of unexplored loop, about 0.4 % of distance). Full-graph solve on 1100 nodes: mean 8 ms, max 34 ms on a laptop.
+
+**Moving objects (2026-11-02).** In a long corridor the walls say nothing along it, so anything moving in view steers scan matching. The worst case is people walking beside the robot: they look static to it, and the map stretches by about 2 %. So before matching, a point sitting where an older node's scan looked past it (4, 8, 12, 16 nodes back, by > 0.3 m; at least 2 of 3 neighbouring beams must have returned, all from beyond it) is dropped as moved. It needs only the lidar and works in all directions. Dropped points are published on `/moving_points`. An empty beam counts as no evidence, because real lidars have NaN beams. The filter compares scans along the chain of sequential steps, not the optimised poses: those change whenever a back-end result arrives, which made results depend on timing.
+
+This repo's own nodes on recorded Gazebo runs (24 x 16 m floor, figure-8, 193 m, LD06-like scans, people moved continuously, one noise seed, 3x replay), final path vs exact Gazebo poses, bad / rover-quality odometry:
+
+| Moving objects | no filter | filter |
+|---|---|---|
+| none | 2.3 / 2.1 cm | 2.2 / 2.1 cm |
+| one person following | 2.2 / 3.4 cm | 2.2 / 2.9 cm |
+| 8 people crossing and circling | 4.2 / 1.4 cm | 1.7 / 1.7 cm |
+| people stopping, slow walkers, creeping objects | 3.7 / 2.6 cm | 3.8 / 3.3 cm |
+| 2 people walking beside the robot | **23.0 / 22.9 cm** | **2.6 / 2.6 cm** |
+| all of the above slow cases together | **21.7 / 21.9 cm** | **3.2 / 3.1 cm** |
+
+After rigid alignment the error is 1.3-1.7 cm with the filter, and 13.6-14.7 cm without it in the last two rows. Loop closures 137-139 in every run. The three small routes stay at 0.2-0.4 cm with or without the filter. The filter is not free: it drops about 6 static points per node with nothing moving (thin objects, wall ends), and the stopping row gets 0.1-0.7 cm worse. `/moving_points` protects SLAM but is too incomplete for obstacle avoidance: use `/scan` for that. It only updates at nodes, so it stops when the robot stops. All of this is simulation, and the simulated people glide without a walking gait.
+
+Start SLAM with the robot still: node 0 fixes the map's orientation. A wait for "not turning" was tried and rejected: the map then inherits the odometry's drift over the whole spin it waited through (7 deg with bad odometry).
 
 Known limit: during spins in place the swept, angle-binned scans carry a small heading bias (clean scans do not show it; the exact cause is not proven). Real LD06 data is needed to settle it, and to decide on `seq_local_map_nodes` (3 by default; 21 gives a better online pose and map shape, but a 0.1-0.2 deg rotation of the whole map). All results above are from simulation, not a real robot.
 
@@ -181,6 +199,8 @@ Drive **3–5 complete laps** to generate enough loop closures for visible drift
 | `scan_skip` | `3` | Publish every N-th scan in the point cloud (higher = faster, fewer points) |
 | `rviz` | `true` | Launch RViz2 |
 
+`graph_builder_node` parameters for moving objects: `dynamic_filter_back` (nodes back to compare with; empty = off), `dynamic_filter_margin` (0.3 m), `dynamic_filter_tol` (1 beam either side).
+
 ---
 
 ## RViz displays
@@ -192,6 +212,7 @@ Set **Fixed Frame** to `map`, then add:
 | MarkerArray | `/graph_markers` — nodes (white), odom edges (blue), loop closure edges (red) |
 | Path | `/optimized_path` (green), `/odom_path` (odometry alone), `/gt_path` (sim only) |
 | PointCloud2 | `/point_cloud_map` |
+| PointCloud2 | `/moving_points` — lidar points dropped as moving (red) |
 
 ---
 
